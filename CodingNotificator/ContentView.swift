@@ -386,13 +386,16 @@ actor UsageReader {
             for line in contents.split(whereSeparator: \.isNewline).reversed() {
                 guard line.contains("\"token_count\""),
                       let data = String(line).data(using: .utf8),
-                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      object["type"] as? String == "event_msg",
+                      let payload = object["payload"] as? [String: Any],
+                      payload["type"] as? String == "token_count",
+                      let rateLimits = payload["rate_limits"] as? [String: Any] else {
                     continue
                 }
 
                 let eventDate = dateValue(object["timestamp"]) ?? file.modifiedAt ?? .distantPast
-                guard eventDate >= latestEventDate,
-                      let payload = object["payload"] as? [String: Any] else {
+                guard eventDate >= latestEventDate else {
                     continue
                 }
 
@@ -408,16 +411,16 @@ actor UsageReader {
                     snapshot.codexTokens.total = intValue(usage["total_tokens"])
                 }
 
-                if let rateLimits = payload["rate_limits"] as? [String: Any] {
-                    if let primary = rateLimits["primary"] as? [String: Any] {
-                        snapshot.codexPrimaryLimit = doubleValue(primary["used_percent"])
-                        snapshot.codexPrimaryResetAt = resetDate(from: primary)
-                    }
+                if let primary = rateLimits["primary"] as? [String: Any],
+                   let usedPercent = doubleValue(primary["used_percent"]) {
+                    snapshot.codexPrimaryLimit = usedPercent
+                    snapshot.codexPrimaryResetAt = resetDate(from: primary)
+                }
 
-                    if let secondary = rateLimits["secondary"] as? [String: Any] {
-                        snapshot.codexSecondaryLimit = doubleValue(secondary["used_percent"])
-                        snapshot.codexSecondaryResetAt = resetDate(from: secondary)
-                    }
+                if let secondary = rateLimits["secondary"] as? [String: Any],
+                   let usedPercent = doubleValue(secondary["used_percent"]) {
+                    snapshot.codexSecondaryLimit = usedPercent
+                    snapshot.codexSecondaryResetAt = resetDate(from: secondary)
                 }
 
                 break
