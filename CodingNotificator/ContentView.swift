@@ -693,6 +693,144 @@ final class OpenCodeEventFileMonitor {
     }
 }
 
+final class CodexSessionQuestionMonitor {
+    private let sessionsURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".codex/sessions", isDirectory: true)
+    private var timer: Timer?
+    private var seenLines = Set<String>()
+    private var onQuestion: (([String: Any]) -> Void)?
+    private var didBootstrap = false
+
+    func start(onQuestion: @escaping ([String: Any]) -> Void) {
+        self.onQuestion = onQuestion
+
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 0.75, repeats: true) { [weak self] _ in
+            self?.poll()
+        }
+
+        if let timer {
+            RunLoop.main.add(timer, forMode: .common)
+        }
+
+        poll()
+        didBootstrap = true
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func poll() {
+        for file in latestSessionFiles().prefix(8) {
+            guard let contents = tailString(from: file.url, maxBytes: 600_000) else { continue }
+
+            for rawLine in contents.split(whereSeparator: \.isNewline) {
+                let line = String(rawLine)
+                guard line.contains("request_user_input") else { continue }
+                guard !seenLines.contains(line) else { continue }
+                seenLines.insert(line)
+
+                guard didBootstrap,
+                      let payload = questionPayload(from: line) else {
+                    continue
+                }
+
+                logQuestionPayload(payload)
+                onQuestion?(payload)
+            }
+        }
+    }
+
+    private func questionPayload(from line: String) -> [String: Any]? {
+        guard let data = line.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let payload = object["payload"] as? [String: Any],
+              payload["name"] as? String == "request_user_input",
+              let argumentsText = payload["arguments"] as? String,
+              let argumentsData = argumentsText.data(using: .utf8),
+              let arguments = try? JSONSerialization.jsonObject(with: argumentsData) as? [String: Any] else {
+            return nil
+        }
+
+        let message = questionMessage(from: arguments)
+
+        return [
+            "event": "question_asked",
+            "source": "codex",
+            "title": "Approval needed",
+            "message": message.isEmpty ? "Codex has a question for you" : message,
+            "properties": arguments
+        ]
+    }
+
+    private func logQuestionPayload(_ payload: [String: Any]) {
+        let supportURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("CodingNotificator", isDirectory: true)
+        try? FileManager.default.createDirectory(at: supportURL, withIntermediateDirectories: true)
+
+        let logURL = supportURL.appendingPathComponent("session-question-log.jsonl")
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let line = String(data: data, encoding: .utf8) else {
+            return
+        }
+
+        if let handle = try? FileHandle(forWritingTo: logURL) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: Data((line + "\n").utf8))
+        } else {
+            try? (line + "\n").write(to: logURL, atomically: true, encoding: .utf8)
+        }
+    }
+
+    private func questionMessage(from arguments: [String: Any]) -> String {
+        guard let questions = arguments["questions"] as? [[String: Any]] else { return "" }
+
+        if let question = questions.first?["question"] as? String,
+           !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return question.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        if let header = questions.first?["header"] as? String,
+           !header.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return header.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        return ""
+    }
+
+    private func latestSessionFiles() -> [(url: URL, modifiedAt: Date?)] {
+        guard let enumerator = FileManager.default.enumerator(
+            at: sessionsURL,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        return enumerator.compactMap { item in
+            guard let url = item as? URL, url.pathExtension == "jsonl" else { return nil }
+            let values = try? url.resourceValues(forKeys: [.contentModificationDateKey])
+            return (url, values?.contentModificationDate)
+        }
+        .sorted { ($0.modifiedAt ?? .distantPast) > ($1.modifiedAt ?? .distantPast) }
+    }
+
+    private func tailString(from url: URL, maxBytes: UInt64) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+
+        let size = (try? handle.seekToEnd()) ?? 0
+        let offset = size > maxBytes ? size - maxBytes : 0
+        try? handle.seek(toOffset: offset)
+
+        guard let data = try? handle.readToEnd(), !data.isEmpty else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+}
+
 @MainActor
 final class NotchNotifierModel: ObservableObject {
     static let shared = NotchNotifierModel()
@@ -719,6 +857,7 @@ final class NotchNotifierModel: ObservableObject {
         NotchNotifierModel.eventFileURL,
         NotchNotifierModel.containerEventFileURL
     ])
+    private let codexQuestionMonitor = CodexSessionQuestionMonitor()
     private var overlayController: NotchOverlayController?
     private var didStart = false
 
@@ -732,6 +871,12 @@ final class NotchNotifierModel: ObservableObject {
         print("Watching event files:", Self.eventFileURL.path, Self.containerEventFileURL.path)
 
         monitor.start { [weak self] payload in
+            Task { @MainActor in
+                self?.handle(payload: payload)
+            }
+        }
+
+        codexQuestionMonitor.start { [weak self] payload in
             Task { @MainActor in
                 self?.handle(payload: payload)
             }
