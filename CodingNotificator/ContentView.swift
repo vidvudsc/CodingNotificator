@@ -770,27 +770,28 @@ final class NotchNotifierModel: ObservableObject {
 
         let title = textValue(for: "title", in: payload)
         let message = messageText(from: payload)
+        let source = sourceName(for: payload, event: event)
 
         switch event {
-        case "done", "session.idle":
+        case "done", "completed", "complete", "finished", "finish", "success", "session.idle", "session_idle", "task_completed", "task_complete", "turn_completed", "turn_complete", "agent_turn_completed", "agent_turn_complete":
             showDone(
-                title: title.isEmpty ? "Done" : title,
-                message: message.isEmpty ? "OpenCode finished" : message
+                title: title.isEmpty ? "\(source) done" : title,
+                message: message.isEmpty ? "\(source) finished" : message
             )
 
-        case "approval", "permission", "permission.asked", "permission.updated", "question.asked", "requires_input", "required_input", "input_required", "needs_input":
+        case "approval", "approval_requested", "permission", "permission.asked", "permission.updated", "permission_asked", "permission_updated", "permission_request", "question.asked", "question_asked", "requires_input", "required_input", "input_required", "needs_input", "user_input_requested":
             showApproval(
                 title: title.isEmpty ? "Approval needed" : title,
-                message: message.isEmpty ? "OpenCode needs your input" : message
+                message: message.isEmpty ? "\(source) needs your input" : message
             )
 
-        case "failed", "error", "session.error":
+        case "failed", "failure", "error", "errored", "session.error", "session_error", "task_failed", "task_error":
             showFailure(
                 title: title.isEmpty ? "Failed" : title,
-                message: message.isEmpty ? "OpenCode hit an error" : message
+                message: message.isEmpty ? "\(source) hit an error" : message
             )
 
-        case "running", "busy", "session.busy":
+        case "running", "busy", "started", "start", "session.busy", "session_busy", "task_started", "task_start", "turn_started", "turn_start", "agent_turn_started", "agent_turn_start":
             showRunning(
                 title: title,
                 message: message
@@ -827,6 +828,23 @@ final class NotchNotifierModel: ObservableObject {
             .replacingOccurrences(of: "-", with: "_")
     }
 
+    private func sourceName(for payload: [String: Any], event: String) -> String {
+        let rawSource = textValue(for: "source", in: payload)
+            .lowercased()
+
+        if rawSource.contains("codex")
+            || event.hasPrefix("task_")
+            || event.hasPrefix("turn_")
+            || event.hasPrefix("agent_turn_")
+            || payload["turn_id"] != nil
+            || payload["rate_limits"] != nil
+            || payload["model_context_window"] != nil {
+            return "Codex"
+        }
+
+        return "OpenCode"
+    }
+
     private func textValue(for key: String, in payload: [String: Any]) -> String {
         if let value = payload[key] as? String {
             return value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -837,6 +855,11 @@ final class NotchNotifierModel: ObservableObject {
             return value.trimmingCharacters(in: .whitespacesAndNewlines)
         }
 
+        if let nestedPayload = payload["payload"] as? [String: Any],
+           let value = nestedPayload[key] as? String {
+            return value.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
         return ""
     }
 
@@ -844,6 +867,13 @@ final class NotchNotifierModel: ObservableObject {
         let directMessage = textValue(for: "message", in: payload)
         if !directMessage.isEmpty {
             return directMessage
+        }
+
+        for key in ["text", "summary", "body", "detail", "details"] {
+            let value = textValue(for: key, in: payload)
+            if !value.isEmpty {
+                return value
+            }
         }
 
         guard let properties = payload["properties"] as? [String: Any] else { return "" }
