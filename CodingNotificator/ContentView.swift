@@ -701,6 +701,7 @@ final class CodexSessionQuestionMonitor {
         .appendingPathComponent(".codex/sessions", isDirectory: true)
     private var timer: Timer?
     private var seenLines = Set<String>()
+    private var fileOffsets: [URL: UInt64] = [:]
     private var onQuestion: (([String: Any]) -> Void)?
     private var didBootstrap = false
 
@@ -708,7 +709,7 @@ final class CodexSessionQuestionMonitor {
         self.onQuestion = onQuestion
 
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.75, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.poll()
         }
 
@@ -727,7 +728,7 @@ final class CodexSessionQuestionMonitor {
 
     private func poll() {
         for file in latestSessionFiles().prefix(8) {
-            guard let contents = tailString(from: file.url, maxBytes: 600_000) else { continue }
+            guard let contents = appendedString(from: file.url) else { continue }
 
             for rawLine in contents.split(whereSeparator: \.isNewline) {
                 let line = String(rawLine)
@@ -821,13 +822,18 @@ final class CodexSessionQuestionMonitor {
         .sorted { ($0.modifiedAt ?? .distantPast) > ($1.modifiedAt ?? .distantPast) }
     }
 
-    private func tailString(from url: URL, maxBytes: UInt64) -> String? {
+    private func appendedString(from url: URL) -> String? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
 
         let size = (try? handle.seekToEnd()) ?? 0
-        let offset = size > maxBytes ? size - maxBytes : 0
-        try? handle.seek(toOffset: offset)
+        let defaultOffset: UInt64 = didBootstrap ? 0 : size
+        let previousOffset = min(fileOffsets[url] ?? defaultOffset, size)
+        fileOffsets[url] = size
+
+        guard didBootstrap, size > previousOffset else { return nil }
+
+        try? handle.seek(toOffset: previousOffset)
 
         guard let data = try? handle.readToEnd(), !data.isEmpty else { return nil }
         return String(data: data, encoding: .utf8)
