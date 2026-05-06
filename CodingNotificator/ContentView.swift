@@ -927,7 +927,18 @@ final class NotchNotifierModel: ObservableObject {
         let source = sourceName(for: payload, event: event)
 
         switch event {
-        case "done", "completed", "complete", "finished", "finish", "success", "session.idle", "session_idle", "task_completed", "task_complete", "turn_completed", "turn_complete", "agent_turn_completed", "agent_turn_complete":
+        case "agent_turn_complete", "agent_turn_completed":
+            guard shouldShowCodexTurnComplete(payload, source: source) else {
+                print("Ignored Codex background turn completion")
+                return
+            }
+
+            showDone(
+                title: title.isEmpty ? "\(source) done" : title,
+                message: message.isEmpty ? "\(source) finished" : message
+            )
+
+        case "done", "completed", "complete", "finished", "finish", "success", "session.idle", "session_idle", "task_completed", "task_complete", "turn_completed", "turn_complete":
             showDone(
                 title: title.isEmpty ? "\(source) done" : title,
                 message: message.isEmpty ? "\(source) finished" : message
@@ -1044,6 +1055,50 @@ final class NotchNotifierModel: ObservableObject {
         }
 
         return ""
+    }
+
+    func shouldShowCodexTurnComplete(_ payload: [String: Any], source: String) -> Bool {
+        guard source == "Codex" else { return true }
+
+        if codexInputMessages(in: payload).contains(where: isCodexBackgroundPrompt) {
+            return false
+        }
+
+        let assistantMessage = textValue(for: "last-assistant-message", in: payload)
+        if looksLikeCodexTitleResponse(assistantMessage) {
+            return false
+        }
+
+        return true
+    }
+
+    private func codexInputMessages(in payload: [String: Any]) -> [String] {
+        if let messages = payload["input-messages"] as? [String] {
+            return messages
+        }
+
+        if let messages = payload["input_messages"] as? [String] {
+            return messages
+        }
+
+        return []
+    }
+
+    private func isCodexBackgroundPrompt(_ text: String) -> Bool {
+        let normalized = text.lowercased()
+
+        return normalized.contains("generate a concise ui title")
+            || normalized.contains("short title for a task")
+            || normalized.contains("the tasks typically have to do with coding-related tasks")
+            || normalized.contains("fill the structured title field")
+            || normalized.contains("do not respond to the user")
+    }
+
+    private func looksLikeCodexTitleResponse(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.hasPrefix("{\"title\"")
+            || trimmed.hasPrefix("{\n  \"title\"")
+            || trimmed.hasPrefix("{\n    \"title\"")
     }
 
     private func showRunning(title: String, message: String) {
