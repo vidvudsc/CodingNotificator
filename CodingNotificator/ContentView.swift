@@ -935,7 +935,7 @@ final class NotchNotifierModel: ObservableObject {
 
             let codexChatName = codexChatDisplayName(from: payload)
             showDone(
-                title: title.isEmpty ? "\(codexChatName) done" : title,
+                title: title.isEmpty ? "Done: \(codexChatName)" : title,
                 message: message.isEmpty ? "\(source) finished" : message
             )
 
@@ -1564,6 +1564,8 @@ struct OverlayIslandView: View {
                                 .font(.system(size: 11.5, weight: .semibold))
                                 .foregroundColor(.white)
                                 .lineLimit(1)
+                                .truncationMode(.middle)
+                                .frame(maxWidth: .infinity, alignment: .leading)
 
                             Spacer(minLength: 0)
                         }
