@@ -38,4 +38,24 @@ struct CodingNotificatorTests {
         #expect(NotchNotifierModel.shared.shouldShowCodexTurnComplete(payload, source: "Codex"))
     }
 
+    @MainActor
+    @Test func usesCodexCwdProjectNameForDoneTitle() async throws {
+        let payload: [String: Any] = [
+            "type": "agent-turn-complete",
+            "cwd": "/Users/vidvudscalitis/Desktop/CODING/MacHub"
+        ]
+
+        #expect(NotchNotifierModel.shared.codexChatDisplayName(from: payload) == "MacHub")
+    }
+
+    @MainActor
+    @Test func fallsBackToCodexThreadIDWhenCwdIsMissing() async throws {
+        let payload: [String: Any] = [
+            "type": "agent-turn-complete",
+            "thread-id": "019dfd6d-5506-7060-af7e-1532a9f480c6"
+        ]
+
+        #expect(NotchNotifierModel.shared.codexChatDisplayName(from: payload) == "Codex 019dfd6d")
+    }
+
 }

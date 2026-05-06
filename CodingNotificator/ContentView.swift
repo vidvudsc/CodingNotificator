@@ -933,8 +933,9 @@ final class NotchNotifierModel: ObservableObject {
                 return
             }
 
+            let codexChatName = codexChatDisplayName(from: payload)
             showDone(
-                title: title.isEmpty ? "\(source) done" : title,
+                title: title.isEmpty ? "\(codexChatName) done" : title,
                 message: message.isEmpty ? "\(source) finished" : message
             )
 
@@ -1070,6 +1071,28 @@ final class NotchNotifierModel: ObservableObject {
         }
 
         return true
+    }
+
+    func codexChatDisplayName(from payload: [String: Any]) -> String {
+        let cwd = textValue(for: "cwd", in: payload)
+        if !cwd.isEmpty {
+            let projectName = URL(fileURLWithPath: cwd).lastPathComponent
+            if !projectName.isEmpty {
+                return projectName
+            }
+        }
+
+        let threadID = textValue(for: "thread-id", in: payload)
+        if !threadID.isEmpty {
+            return "Codex \(threadID.prefix(8))"
+        }
+
+        let alternateThreadID = textValue(for: "thread_id", in: payload)
+        if !alternateThreadID.isEmpty {
+            return "Codex \(alternateThreadID.prefix(8))"
+        }
+
+        return "Codex"
     }
 
     private func codexInputMessages(in payload: [String: Any]) -> [String] {
