@@ -374,9 +374,7 @@ actor UsageReader {
     }
 
     private func readCodexUsage(into snapshot: inout UsageSnapshot) {
-        let files = jsonlFiles(in: home.appendingPathComponent(".codex/sessions"))
-            .sorted { ($0.modifiedAt ?? .distantPast) > ($1.modifiedAt ?? .distantPast) }
-            .prefix(8)
+        let files = codexSessionFiles(limit: 8)
 
         var latestEventDate = Date.distantPast
 
@@ -413,14 +411,16 @@ actor UsageReader {
 
                 if let primary = rateLimits["primary"] as? [String: Any],
                    let usedPercent = doubleValue(primary["used_percent"]) {
-                    snapshot.codexPrimaryLimit = usedPercent
-                    snapshot.codexPrimaryResetAt = resetDate(from: primary)
+                    let resetAt = resetDate(from: primary)
+                    snapshot.codexPrimaryLimit = activeUsedPercent(usedPercent, rateLimit: primary, eventDate: eventDate)
+                    snapshot.codexPrimaryResetAt = resetAt
                 }
 
                 if let secondary = rateLimits["secondary"] as? [String: Any],
                    let usedPercent = doubleValue(secondary["used_percent"]) {
-                    snapshot.codexSecondaryLimit = usedPercent
-                    snapshot.codexSecondaryResetAt = resetDate(from: secondary)
+                    let resetAt = resetDate(from: secondary)
+                    snapshot.codexSecondaryLimit = activeUsedPercent(usedPercent, rateLimit: secondary, eventDate: eventDate)
+                    snapshot.codexSecondaryResetAt = resetAt
                 }
 
                 break
@@ -430,6 +430,47 @@ actor UsageReader {
                let model = latestModel(in: contents) {
                 snapshot.codexModel = model
             }
+        }
+    }
+
+    private func codexSessionFiles(limit: Int) -> [(url: URL, modifiedAt: Date?)] {
+        if let indexedFiles = codexSessionFilesFromIndex(limit: limit), !indexedFiles.isEmpty {
+            return indexedFiles
+        }
+
+        return Array(
+            jsonlFiles(in: home.appendingPathComponent(".codex/sessions"))
+                .sorted { ($0.modifiedAt ?? .distantPast) > ($1.modifiedAt ?? .distantPast) }
+                .prefix(limit)
+        )
+    }
+
+    private func codexSessionFilesFromIndex(limit: Int) -> [(url: URL, modifiedAt: Date?)]? {
+        let databaseURL = home.appendingPathComponent(".codex/state_5.sqlite")
+        guard FileManager.default.fileExists(atPath: databaseURL.path) else { return nil }
+
+        let sql = """
+        select rollout_path, updated_at
+        from threads
+        where rollout_path != ''
+        order by updated_at desc
+        limit \(limit);
+        """
+
+        guard let output = runSQLiteQuery(databaseURL: databaseURL, sql: sql), !output.isEmpty else {
+            return nil
+        }
+
+        return output.split(whereSeparator: \.isNewline).compactMap { line in
+            let values = line.split(separator: "\t", omittingEmptySubsequences: false)
+            guard let path = values.first else { return nil }
+
+            let url = URL(fileURLWithPath: String(path))
+            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+
+            let updatedAt = values.count > 1 ? intValue(String(values[1])) : 0
+            let date = updatedAt > 0 ? Date(timeIntervalSince1970: TimeInterval(updatedAt)) : nil
+            return (url, date)
         }
     }
 
@@ -500,6 +541,21 @@ actor UsageReader {
         let timestamp = intValue(object["resets_at"])
         guard timestamp > 0 else { return nil }
         return Date(timeIntervalSince1970: TimeInterval(timestamp))
+    }
+
+    private func activeUsedPercent(_ usedPercent: Double, rateLimit: [String: Any], eventDate: Date) -> Double {
+        let resetAt = resetDate(from: rateLimit)
+        guard let resetAt else { return usedPercent }
+
+        guard resetAt > Date() else { return 0 }
+
+        let windowMinutes = doubleValue(rateLimit["window_minutes"]) ?? 0
+        if windowMinutes > 0 {
+            let windowStart = resetAt.addingTimeInterval(-windowMinutes * 60)
+            guard eventDate >= windowStart.addingTimeInterval(-60) else { return 0 }
+        }
+
+        return usedPercent
     }
 }
 
@@ -1316,15 +1372,27 @@ struct UsagePanelView: View {
     }
 
     private func usageColor(for percent: Double) -> Color {
-        if percent >= 85 { return .red }
-        if percent >= 60 { return .yellow }
-        return .green
+        if percent >= 85 { return barCritical }
+        if percent >= 60 { return barWarning }
+        return barHealthy
     }
 
     private func remainingColor(for percent: Double) -> Color {
-        if percent <= 15 { return .red }
-        if percent <= 40 { return .yellow }
-        return .green
+        if percent <= 15 { return barCritical }
+        if percent <= 40 { return barWarning }
+        return barHealthy
+    }
+
+    private var barHealthy: Color {
+        Color(red: 0.22, green: 0.84, blue: 0.55)
+    }
+
+    private var barWarning: Color {
+        Color(red: 1.00, green: 0.68, blue: 0.25)
+    }
+
+    private var barCritical: Color {
+        Color(red: 0.98, green: 0.32, blue: 0.28)
     }
 
     private func formatPercent(_ value: Double) -> String {
@@ -1404,7 +1472,7 @@ struct UsageSectionView: View {
                         GeometryReader { geometry in
                             ZStack(alignment: .leading) {
                                 Capsule()
-                                    .fill(.tertiary.opacity(0.35))
+                                    .fill(Color.white.opacity(0.12))
 
                                 Capsule()
                                     .fill(row.color)
