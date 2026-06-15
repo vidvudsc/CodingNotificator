@@ -10,7 +10,9 @@ except Exception:
     raise SystemExit(0)
 
 hook_event = payload.get("hook_event_name") or ""
-if hook_event not in {"Notification", "PermissionRequest", "Elicitation", "Stop", "StopFailure"}:
+if hook_event == "Notification":
+    raise SystemExit(0)
+if hook_event not in {"PermissionRequest", "Elicitation", "Stop", "StopFailure"}:
     raise SystemExit(0)
 
 support_dir = os.path.expanduser("~/Library/Application Support/CodingNotificator")
@@ -21,7 +23,7 @@ message = payload.get("message") or ""
 cwd = payload.get("cwd") or ""
 project = os.path.basename(cwd) if cwd else "Claude Code"
 
-if hook_event in {"Notification", "PermissionRequest", "Elicitation"}:
+if hook_event in {"PermissionRequest", "Elicitation"}:
     event = "needs_input"
     title = "Claude needs input"
     if not message:

@@ -38,10 +38,10 @@ The app listens for local event files written by OpenCode, Codex, and Claude Cod
 
 ## Claude Code Setup
 
-Claude Code exposes live usage in its status-line JSON and lifecycle events through hooks. The helper scripts in `scripts/claude/` bridge those into Coding Notificator:
+Claude Code exposes live usage in its status-line JSON and important lifecycle events through hooks. The helper scripts in `scripts/claude/` bridge those into Coding Notificator:
 
 - `codingnotificator_statusline.py` writes `~/Library/Application Support/CodingNotificator/claude-usage.json`.
-- `codingnotificator_hook.py` writes notification events to the same app event file used by other agents.
+- `codingnotificator_hook.py` writes permission, input, completion, and failure events to the same app event file used by other agents.
 
 Install the bridge into Claude Code:
 
