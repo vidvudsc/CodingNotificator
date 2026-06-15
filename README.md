@@ -2,14 +2,15 @@
 
 A small macOS menu bar app for keeping an eye on coding agents without babysitting the terminal.
 
-Coding Notificator watches local OpenCode/Codex activity, shows compact notch-style status updates, plays lightweight sounds for important state changes, and exposes a clean AI usage popover from the menu bar.
+Coding Notificator watches local OpenCode, Codex, and Claude Code activity, shows compact notch-style status updates, plays lightweight sounds for important state changes, and exposes a clean AI usage popover from the menu bar.
 
 ![Coding Notificator usage popover](docs/images/usage-popover.png)
 
 ## What It Does
 
-- Shows Codex and OpenCode usage in a compact menu bar popover.
-- Displays Codex 5h and weekly reset timing from local Codex session data.
+- Shows OpenCode, Codex, and Claude Code usage in a compact menu bar popover.
+- Reads Codex 5h and weekly limits through the local Codex app-server when available.
+- Reads Claude Code 5h and 7d limits through a Claude status-line bridge.
 - Tracks OpenCode 5h, weekly, and monthly usage from the local OpenCode database.
 - Shows notch-style overlays for finished, failed, and input-required agent states.
 - Uses separate sounds for completion, required input, and failure.
@@ -23,16 +24,34 @@ The menu bar panel keeps the app intentionally small:
 
 - **OpenCode**: `5h`, `Weekly`, and `Monthly` usage percentages.
 - **Codex**: `5h left` and `Weekly left`, with reset countdowns when Codex exposes them.
+- **Claude Code**: `5h left` and `7d left`, populated after Claude Code sends status-line data.
 - Progress bars shift from healthy green to warning amber to critical red.
 
 ## Agent Notifications
 
-The app listens for local event files written by OpenCode/Codex helper workflows and turns them into native macOS feedback:
+The app listens for local event files written by OpenCode, Codex, and Claude Code helper workflows and turns them into native macOS feedback:
 
 - `done` / `session.idle`: completion overlay and sound.
 - `requires_input` / `permission.asked`: input-required overlay and sound.
 - `failed` / `session.error`: failure overlay and sound.
 - `running` / `busy`: state update only, no sound.
+
+## Claude Code Setup
+
+Claude Code exposes live usage in its status-line JSON and lifecycle events through hooks. The helper scripts in `scripts/claude/` bridge those into Coding Notificator:
+
+- `codingnotificator_statusline.py` writes `~/Library/Application Support/CodingNotificator/claude-usage.json`.
+- `codingnotificator_hook.py` writes notification events to the same app event file used by other agents.
+
+Install the bridge into Claude Code:
+
+```bash
+mkdir -p ~/.claude
+cp scripts/claude/codingnotificator_*.py ~/.claude/
+chmod +x ~/.claude/codingnotificator_*.py
+```
+
+Then add the scripts to `~/.claude/settings.json` as a status line and hooks. The app starts showing Claude usage after the next Claude Code response, because Claude only emits fresh rate-limit data after API activity.
 
 ## Building
 
@@ -52,4 +71,4 @@ open ~/Applications/CodingNotificator.app
 
 ## Notes
 
-This is a local utility. Usage values come from local OpenCode and Codex files, so OpenCode numbers can differ slightly from the OpenCode web dashboard when the server has usage that has not landed in the local database.
+This is a local utility. OpenCode usage comes from the local OpenCode database, Codex usage comes from the local Codex app-server when available, and Claude Code usage comes from Claude's local status-line payload after Claude Code runs.

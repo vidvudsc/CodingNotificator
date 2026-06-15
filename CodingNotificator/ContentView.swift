@@ -57,6 +57,11 @@ struct UsageSnapshot: Sendable {
     var codexPrimaryResetAt: Date?
     var codexSecondaryResetAt: Date?
     var codexUpdatedAt: Date?
+    var claudeFiveHourLimit: Double?
+    var claudeSevenDayLimit: Double?
+    var claudeFiveHourResetAt: Date?
+    var claudeSevenDayResetAt: Date?
+    var claudeUpdatedAt: Date?
     var refreshedAt = Date()
 
     nonisolated init(
@@ -75,6 +80,11 @@ struct UsageSnapshot: Sendable {
         codexPrimaryResetAt: Date? = nil,
         codexSecondaryResetAt: Date? = nil,
         codexUpdatedAt: Date? = nil,
+        claudeFiveHourLimit: Double? = nil,
+        claudeSevenDayLimit: Double? = nil,
+        claudeFiveHourResetAt: Date? = nil,
+        claudeSevenDayResetAt: Date? = nil,
+        claudeUpdatedAt: Date? = nil,
         refreshedAt: Date = Date()
     ) {
         self.openCodeProvider = openCodeProvider
@@ -92,6 +102,11 @@ struct UsageSnapshot: Sendable {
         self.codexPrimaryResetAt = codexPrimaryResetAt
         self.codexSecondaryResetAt = codexSecondaryResetAt
         self.codexUpdatedAt = codexUpdatedAt
+        self.claudeFiveHourLimit = claudeFiveHourLimit
+        self.claudeSevenDayLimit = claudeSevenDayLimit
+        self.claudeFiveHourResetAt = claudeFiveHourResetAt
+        self.claudeSevenDayResetAt = claudeSevenDayResetAt
+        self.claudeUpdatedAt = claudeUpdatedAt
         self.refreshedAt = refreshedAt
     }
 }
@@ -155,7 +170,9 @@ actor UsageReader {
         var snapshot = UsageSnapshot()
         readOpenCodeUsage(into: &snapshot)
         readCodexUsage(into: &snapshot)
+        readClaudeUsage(into: &snapshot)
         carryForwardCodexUsageIfNeeded(from: previousSnapshot, into: &snapshot)
+        carryForwardClaudeUsageIfNeeded(from: previousSnapshot, into: &snapshot)
         snapshot.refreshedAt = Date()
         cachedSnapshot = snapshot
         cachedAt = snapshot.refreshedAt
@@ -181,6 +198,20 @@ actor UsageReader {
         guard let usedPercent else { return nil }
         guard let resetAt else { return usedPercent }
         return resetAt > Date() ? usedPercent : 0
+    }
+
+    private func carryForwardClaudeUsageIfNeeded(from previousSnapshot: UsageSnapshot?, into snapshot: inout UsageSnapshot) {
+        guard snapshot.claudeUpdatedAt == nil,
+              let previousSnapshot,
+              previousSnapshot.claudeUpdatedAt != nil else {
+            return
+        }
+
+        snapshot.claudeUpdatedAt = previousSnapshot.claudeUpdatedAt
+        snapshot.claudeFiveHourResetAt = previousSnapshot.claudeFiveHourResetAt
+        snapshot.claudeSevenDayResetAt = previousSnapshot.claudeSevenDayResetAt
+        snapshot.claudeFiveHourLimit = carriedRateLimit(previousSnapshot.claudeFiveHourLimit, resetAt: previousSnapshot.claudeFiveHourResetAt)
+        snapshot.claudeSevenDayLimit = carriedRateLimit(previousSnapshot.claudeSevenDayLimit, resetAt: previousSnapshot.claudeSevenDayResetAt)
     }
 
     private func readOpenCodeUsage(into snapshot: inout UsageSnapshot) {
@@ -457,6 +488,37 @@ actor UsageReader {
         } else {
             window.resetAt = date
         }
+    }
+
+    private func readClaudeUsage(into snapshot: inout UsageSnapshot) {
+        let cacheURL = codingNotificatorSupportURL().appendingPathComponent("claude-usage.json")
+        guard let data = try? Data(contentsOf: cacheURL),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rateLimits = object["rate_limits"] as? [String: Any] else {
+            return
+        }
+
+        if let fiveHour = rateLimits["five_hour"] as? [String: Any],
+           let usedPercent = doubleValue(fiveHour["used_percentage"]) {
+            let resetAt = unixDate(from: fiveHour["resets_at"])
+            snapshot.claudeFiveHourLimit = activeCachedUsedPercent(usedPercent, resetAt: resetAt)
+            snapshot.claudeFiveHourResetAt = resetAt
+        }
+
+        if let sevenDay = rateLimits["seven_day"] as? [String: Any],
+           let usedPercent = doubleValue(sevenDay["used_percentage"]) {
+            let resetAt = unixDate(from: sevenDay["resets_at"])
+            snapshot.claudeSevenDayLimit = activeCachedUsedPercent(usedPercent, resetAt: resetAt)
+            snapshot.claudeSevenDayResetAt = resetAt
+        }
+
+        let values = try? cacheURL.resourceValues(forKeys: [.contentModificationDateKey])
+        snapshot.claudeUpdatedAt = values?.contentModificationDate ?? Date()
+    }
+
+    private func codingNotificatorSupportURL() -> URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("CodingNotificator", isDirectory: true)
     }
 
     private func readCodexUsage(into snapshot: inout UsageSnapshot) {
@@ -747,8 +809,19 @@ actor UsageReader {
         return Date(timeIntervalSince1970: TimeInterval(timestamp))
     }
 
+    private func unixDate(from value: Any?) -> Date? {
+        let timestamp = intValue(value)
+        guard timestamp > 0 else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(timestamp))
+    }
+
     private func clampedPercent(_ value: Double) -> Double {
         min(100, max(0, value))
+    }
+
+    private func activeCachedUsedPercent(_ usedPercent: Double, resetAt: Date?) -> Double {
+        guard let resetAt else { return clampedPercent(usedPercent) }
+        return resetAt > Date() ? clampedPercent(usedPercent) : 0
     }
 
     private func activeUsedPercent(_ usedPercent: Double, rateLimit: [String: Any], eventDate: Date) -> Double {
@@ -1263,6 +1336,10 @@ final class NotchNotifierModel: ObservableObject {
         let rawSource = textValue(for: "source", in: payload)
             .lowercased()
 
+        if rawSource.contains("claude") {
+            return "Claude Code"
+        }
+
         if rawSource.contains("codex")
             || event.hasPrefix("task_")
             || event.hasPrefix("turn_")
@@ -1538,6 +1615,22 @@ struct UsagePanelView: View {
                 ]
             )
 
+            UsageSectionView(
+                title: "Claude Code",
+                rows: [
+                    remainingRow(
+                        "5h left",
+                        remainingPercent: claudeFiveHourLeft,
+                        resetAt: model.snapshot.claudeFiveHourResetAt
+                    ),
+                    remainingRow(
+                        "7d left",
+                        remainingPercent: claudeSevenDayLeft,
+                        resetAt: model.snapshot.claudeSevenDayResetAt
+                    )
+                ]
+            )
+
         }
         .padding(10)
         .frame(width: 300)
@@ -1552,6 +1645,14 @@ struct UsagePanelView: View {
 
     private var codexSecondaryLeft: Double? {
         model.snapshot.codexSecondaryLimit.map { 100 - $0 }
+    }
+
+    private var claudeFiveHourLeft: Double? {
+        model.snapshot.claudeFiveHourLimit.map { 100 - $0 }
+    }
+
+    private var claudeSevenDayLeft: Double? {
+        model.snapshot.claudeSevenDayLimit.map { 100 - $0 }
     }
 
     private func usageRow(_ label: String, usedPercent: Double) -> UsageDisplayRow {
