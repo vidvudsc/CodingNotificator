@@ -96,19 +96,97 @@ struct UsageSnapshot: Sendable {
     }
 }
 
+private nonisolated final class CodexAppServerResponseBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private let completed: DispatchSemaphore
+    private var data = Data()
+    private var didSignal = false
+    private var didReceiveRateLimits = false
+
+    init(completed: DispatchSemaphore) {
+        self.completed = completed
+    }
+
+    func append(_ chunk: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !chunk.isEmpty else {
+            signalOnce()
+            return
+        }
+
+        data.append(chunk)
+        if let text = String(data: data, encoding: .utf8),
+           text.contains("\"id\":1") {
+            didReceiveRateLimits = true
+            signalOnce()
+        }
+    }
+
+    func snapshot() -> (data: Data, didReceiveRateLimits: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (data, didReceiveRateLimits)
+    }
+
+    private func signalOnce() {
+        if !didSignal {
+            didSignal = true
+            completed.signal()
+        }
+    }
+}
+
 actor UsageReader {
     private let home = FileManager.default.homeDirectoryForCurrentUser
+    private var cachedSnapshot: UsageSnapshot?
+    private var cachedAt: Date?
 
-    func readSnapshot() -> UsageSnapshot {
+    func readSnapshot(force: Bool = false) -> UsageSnapshot {
+        if !force,
+           let cachedSnapshot,
+           let cachedAt,
+           Date().timeIntervalSince(cachedAt) < 20 {
+            return cachedSnapshot
+        }
+
+        let previousSnapshot = cachedSnapshot
         var snapshot = UsageSnapshot()
         readOpenCodeUsage(into: &snapshot)
         readCodexUsage(into: &snapshot)
+        carryForwardCodexUsageIfNeeded(from: previousSnapshot, into: &snapshot)
         snapshot.refreshedAt = Date()
+        cachedSnapshot = snapshot
+        cachedAt = snapshot.refreshedAt
         return snapshot
     }
 
+    private func carryForwardCodexUsageIfNeeded(from previousSnapshot: UsageSnapshot?, into snapshot: inout UsageSnapshot) {
+        guard snapshot.codexUpdatedAt == nil,
+              let previousSnapshot,
+              previousSnapshot.codexUpdatedAt != nil else {
+            return
+        }
+
+        snapshot.codexTokens = previousSnapshot.codexTokens
+        snapshot.codexUpdatedAt = previousSnapshot.codexUpdatedAt
+        snapshot.codexPrimaryResetAt = previousSnapshot.codexPrimaryResetAt
+        snapshot.codexSecondaryResetAt = previousSnapshot.codexSecondaryResetAt
+        snapshot.codexPrimaryLimit = carriedRateLimit(previousSnapshot.codexPrimaryLimit, resetAt: previousSnapshot.codexPrimaryResetAt)
+        snapshot.codexSecondaryLimit = carriedRateLimit(previousSnapshot.codexSecondaryLimit, resetAt: previousSnapshot.codexSecondaryResetAt)
+    }
+
+    private func carriedRateLimit(_ usedPercent: Double?, resetAt: Date?) -> Double? {
+        guard let usedPercent else { return nil }
+        guard let resetAt else { return usedPercent }
+        return resetAt > Date() ? usedPercent : 0
+    }
+
     private func readOpenCodeUsage(into snapshot: inout UsageSnapshot) {
-        if readOpenCodeUsageFromDatabase(into: &snapshot) {
+        let databaseURL = home.appendingPathComponent(".local/share/opencode/opencode.db")
+        if FileManager.default.fileExists(atPath: databaseURL.path) {
+            _ = readOpenCodeUsageFromDatabase(into: &snapshot)
             return
         }
 
@@ -190,7 +268,7 @@ actor UsageReader {
         limit 1;
         """
 
-        if let latest = runSQLiteQuery(databaseURL: databaseURL, sql: latestSQL)?
+        if let latest = runSQLiteQuery(databaseURL: databaseURL, sql: latestSQL, timeout: 0.7)?
             .split(separator: "\t", omittingEmptySubsequences: false),
            latest.count >= 2 {
             snapshot.openCodeProvider = String(latest[0])
@@ -258,7 +336,7 @@ actor UsageReader {
         from msgs, bounds;
         """
 
-        guard let output = runSQLiteQuery(databaseURL: databaseURL, sql: usageSQL) else { return false }
+        guard let output = runSQLiteQuery(databaseURL: databaseURL, sql: usageSQL, timeout: 1.2) else { return false }
         let values = output.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
         guard values.count >= 31, intValue(values[0]) > 0 else { return false }
 
@@ -315,7 +393,7 @@ actor UsageReader {
         )
     }
 
-    private func runSQLiteQuery(databaseURL: URL, sql: String) -> String? {
+    private func runSQLiteQuery(databaseURL: URL, sql: String, timeout: TimeInterval = 0.8) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
         process.arguments = ["-tabs", "-noheader", databaseURL.path, sql]
@@ -323,11 +401,19 @@ actor UsageReader {
         let output = Pipe()
         process.standardOutput = output
         process.standardError = Pipe()
+        let completed = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            completed.signal()
+        }
 
         do {
             try process.run()
-            process.waitUntilExit()
         } catch {
+            return nil
+        }
+
+        if completed.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
             return nil
         }
 
@@ -374,12 +460,122 @@ actor UsageReader {
     }
 
     private func readCodexUsage(into snapshot: inout UsageSnapshot) {
+        if readCodexUsageFromAppServer(into: &snapshot) {
+            return
+        }
+
+        readCodexUsageFromSessionFiles(into: &snapshot)
+    }
+
+    private func readCodexUsageFromAppServer(into snapshot: inout UsageSnapshot) -> Bool {
+        guard let output = runCodexAppServerRateLimitQuery() else { return false }
+
+        for line in output.split(whereSeparator: \.isNewline) {
+            guard let data = String(line).data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  intValue(object["id"]) == 1,
+                  let result = object["result"] as? [String: Any],
+                  let rateLimits = result["rateLimits"] as? [String: Any] else {
+                continue
+            }
+
+            var foundRateLimit = false
+
+            if let primary = rateLimits["primary"] as? [String: Any],
+               let usedPercent = doubleValue(primary["usedPercent"] ?? primary["used_percent"]) {
+                snapshot.codexPrimaryLimit = clampedPercent(usedPercent)
+                snapshot.codexPrimaryResetAt = appServerResetDate(from: primary)
+                foundRateLimit = true
+            }
+
+            if let secondary = rateLimits["secondary"] as? [String: Any],
+               let usedPercent = doubleValue(secondary["usedPercent"] ?? secondary["used_percent"]) {
+                snapshot.codexSecondaryLimit = clampedPercent(usedPercent)
+                snapshot.codexSecondaryResetAt = appServerResetDate(from: secondary)
+                foundRateLimit = true
+            }
+
+            if foundRateLimit {
+                snapshot.codexUpdatedAt = Date()
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func runCodexAppServerRateLimitQuery(timeout: TimeInterval = 5) -> String? {
+        guard let executableURL = codexExecutableURL() else { return nil }
+
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = ["app-server", "--listen", "stdio://"]
+
+        let input = Pipe()
+        let output = Pipe()
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = Pipe()
+
+        let completed = DispatchSemaphore(value: 0)
+        let responseBuffer = CodexAppServerResponseBuffer(completed: completed)
+
+        output.fileHandleForReading.readabilityHandler = { handle in
+            responseBuffer.append(handle.availableData)
+        }
+
+        do {
+            try process.run()
+        } catch {
+            output.fileHandleForReading.readabilityHandler = nil
+            return nil
+        }
+
+        let request = """
+        {"method":"initialize","id":0,"params":{"clientInfo":{"name":"codingnotificator","title":"Coding Notificator","version":"1.0"}}}
+        {"method":"initialized","params":{}}
+        {"method":"account/rateLimits/read","id":1,"params":{}}
+
+        """
+
+        if let data = request.data(using: .utf8) {
+            input.fileHandleForWriting.write(data)
+        }
+
+        let didComplete = completed.wait(timeout: .now() + timeout) == .success
+
+        output.fileHandleForReading.readabilityHandler = nil
+        try? input.fileHandleForWriting.close()
+
+        if process.isRunning {
+            process.terminate()
+        }
+
+        let response = responseBuffer.snapshot()
+
+        guard didComplete, response.didReceiveRateLimits else { return nil }
+        return String(data: response.data, encoding: .utf8)
+    }
+
+    private func codexExecutableURL() -> URL? {
+        let candidates = [
+            "/Applications/Codex.app/Contents/Resources/codex",
+            "/opt/homebrew/bin/codex",
+            "/usr/local/bin/codex"
+        ]
+
+        return candidates
+            .map(URL.init(fileURLWithPath:))
+            .first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+
+    private func readCodexUsageFromSessionFiles(into snapshot: inout UsageSnapshot) {
         let files = codexSessionFiles(limit: 8)
 
         var latestEventDate = Date.distantPast
 
         for file in files {
-            guard let contents = tailString(from: file.url) else { continue }
+            guard let contents = tailString(from: file.url, maxBytes: 300_000) else { continue }
 
             for line in contents.split(whereSeparator: \.isNewline).reversed() {
                 guard line.contains("\"token_count\""),
@@ -426,16 +622,16 @@ actor UsageReader {
                 break
             }
 
-            if snapshot.codexModel == "Not found",
-               let model = latestModel(in: contents) {
-                snapshot.codexModel = model
+            if snapshot.codexUpdatedAt != nil {
+                return
             }
         }
     }
 
     private func codexSessionFiles(limit: Int) -> [(url: URL, modifiedAt: Date?)] {
-        if let indexedFiles = codexSessionFilesFromIndex(limit: limit), !indexedFiles.isEmpty {
-            return indexedFiles
+        let indexURL = home.appendingPathComponent(".codex/state_5.sqlite")
+        if FileManager.default.fileExists(atPath: indexURL.path) {
+            return codexSessionFilesFromIndex(limit: limit) ?? []
         }
 
         return Array(
@@ -457,7 +653,7 @@ actor UsageReader {
         limit \(limit);
         """
 
-        guard let output = runSQLiteQuery(databaseURL: databaseURL, sql: sql), !output.isEmpty else {
+        guard let output = runSQLiteQuery(databaseURL: databaseURL, sql: sql, timeout: 0.35), !output.isEmpty else {
             return nil
         }
 
@@ -521,6 +717,7 @@ actor UsageReader {
     private func intValue(_ value: Any?) -> Int {
         if let int = value as? Int { return int }
         if let double = value as? Double { return Int(double) }
+        if let number = value as? NSNumber { return number.intValue }
         if let string = value as? String { return Int(string) ?? 0 }
         return 0
     }
@@ -528,6 +725,7 @@ actor UsageReader {
     private func doubleValue(_ value: Any?) -> Double? {
         if let double = value as? Double { return double }
         if let int = value as? Int { return Double(int) }
+        if let number = value as? NSNumber { return number.doubleValue }
         if let string = value as? String { return Double(string) }
         return nil
     }
@@ -541,6 +739,16 @@ actor UsageReader {
         let timestamp = intValue(object["resets_at"])
         guard timestamp > 0 else { return nil }
         return Date(timeIntervalSince1970: TimeInterval(timestamp))
+    }
+
+    private func appServerResetDate(from object: [String: Any]) -> Date? {
+        let timestamp = intValue(object["resetsAt"] ?? object["resets_at"])
+        guard timestamp > 0 else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(timestamp))
+    }
+
+    private func clampedPercent(_ value: Double) -> Double {
+        min(100, max(0, value))
     }
 
     private func activeUsedPercent(_ usedPercent: Double, rateLimit: [String: Any], eventDate: Date) -> Double {
@@ -563,14 +771,15 @@ actor UsageReader {
 final class UsagePanelModel: ObservableObject {
     @Published var snapshot = UsageSnapshot()
     @Published var isLoading = false
+    private static let reader = UsageReader()
     private var refreshTask: Task<Void, Never>?
 
-    func refresh() {
+    func refresh(force: Bool = false) {
         refreshTask?.cancel()
         isLoading = true
 
         refreshTask = Task {
-            let nextSnapshot = await UsageReader().readSnapshot()
+            let nextSnapshot = await Self.reader.readSnapshot(force: force)
 
             guard !Task.isCancelled else { return }
             snapshot = nextSnapshot
@@ -1287,7 +1496,7 @@ struct UsagePanelView: View {
                 }
 
                 Button {
-                    model.refresh()
+                    model.refresh(force: true)
                 } label: {
                     Image(systemName: "arrow.clockwise")
                 }
