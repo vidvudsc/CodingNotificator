@@ -491,6 +491,10 @@ actor UsageReader {
     }
 
     private func readClaudeUsage(into snapshot: inout UsageSnapshot) {
+        if readClaudeUsageFromCommand(into: &snapshot) {
+            return
+        }
+
         let cacheURL = codingNotificatorSupportURL().appendingPathComponent("claude-usage.json")
         guard let data = try? Data(contentsOf: cacheURL),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -514,6 +518,112 @@ actor UsageReader {
 
         let values = try? cacheURL.resourceValues(forKeys: [.contentModificationDateKey])
         snapshot.claudeUpdatedAt = values?.contentModificationDate ?? Date()
+    }
+
+    private func readClaudeUsageFromCommand(into snapshot: inout UsageSnapshot) -> Bool {
+        guard let output = runClaudeUsageCommand() else { return false }
+
+        var foundUsage = false
+
+        for line in output.split(whereSeparator: \.isNewline).map(String.init) {
+            if line.contains("Current session:"),
+               let parsed = parseClaudeUsageLine(line) {
+                snapshot.claudeFiveHourLimit = parsed.usedPercent
+                snapshot.claudeFiveHourResetAt = parsed.resetAt
+                foundUsage = true
+            }
+
+            if line.contains("Current week"),
+               let parsed = parseClaudeUsageLine(line) {
+                snapshot.claudeSevenDayLimit = parsed.usedPercent
+                snapshot.claudeSevenDayResetAt = parsed.resetAt
+                foundUsage = true
+            }
+        }
+
+        if foundUsage {
+            snapshot.claudeUpdatedAt = Date()
+        }
+
+        return foundUsage
+    }
+
+    private func runClaudeUsageCommand(timeout: TimeInterval = 4) -> String? {
+        guard let executableURL = claudeExecutableURL() else { return nil }
+
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = ["--print", "--output-format", "text"]
+
+        let input = Pipe()
+        let output = Pipe()
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = Pipe()
+
+        let completed = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            completed.signal()
+        }
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+
+        input.fileHandleForWriting.write(Data("/usage\n".utf8))
+        try? input.fileHandleForWriting.close()
+
+        if completed.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            return nil
+        }
+
+        guard process.terminationStatus == 0 else { return nil }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)
+    }
+
+    private func claudeExecutableURL() -> URL? {
+        let candidates = [
+            "/opt/homebrew/bin/claude",
+            "/usr/local/bin/claude"
+        ]
+
+        return candidates
+            .map(URL.init(fileURLWithPath:))
+            .first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+
+    private func parseClaudeUsageLine(_ line: String) -> (usedPercent: Double, resetAt: Date?)? {
+        guard let percentRange = line.range(of: #"\d+(?=% used)"#, options: .regularExpression),
+              let usedPercent = Double(line[percentRange]) else {
+            return nil
+        }
+
+        let resetAt = parseClaudeResetDate(from: line)
+        return (clampedPercent(usedPercent), resetAt)
+    }
+
+    private func parseClaudeResetDate(from line: String) -> Date? {
+        guard let resetsRange = line.range(of: "resets ") else { return nil }
+
+        var text = String(line[resetsRange.upperBound...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let parenRange = text.range(of: " (") {
+            text = String(text[..<parenRange.lowerBound])
+        }
+
+        let calendar = Calendar.current
+        let year = calendar.component(.year, from: Date())
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
+        formatter.dateFormat = "MMM d 'at' h:mma yyyy"
+
+        return formatter.date(from: "\(text.uppercased()) \(year)")
     }
 
     private func codingNotificatorSupportURL() -> URL {
@@ -1584,17 +1694,20 @@ struct UsagePanelView: View {
             UsageSectionView(
                 title: "OpenCode",
                 rows: [
-                    usageRow(
-                        "5h",
-                        usedPercent: openCodePercent(model.snapshot.openCodeFiveHour, limit: 12)
+                    remainingRow(
+                        "5h left",
+                        remainingPercent: openCodeFiveHourLeft,
+                        resetAt: nil
                     ),
-                    usageRow(
-                        "Weekly",
-                        usedPercent: openCodePercent(model.snapshot.openCodeWeekly, limit: 30)
+                    remainingRow(
+                        "Weekly left",
+                        remainingPercent: openCodeWeeklyLeft,
+                        resetAt: nil
                     ),
-                    usageRow(
-                        "Monthly",
-                        usedPercent: openCodePercent(model.snapshot.openCodeMonthly, limit: 60)
+                    remainingRow(
+                        "Monthly left",
+                        remainingPercent: openCodeMonthlyLeft,
+                        resetAt: nil
                     )
                 ]
             )
@@ -1643,6 +1756,18 @@ struct UsagePanelView: View {
         model.snapshot.codexPrimaryLimit.map { 100 - $0 }
     }
 
+    private var openCodeFiveHourLeft: Double {
+        openCodeRemainingPercent(model.snapshot.openCodeFiveHour, limit: 12)
+    }
+
+    private var openCodeWeeklyLeft: Double {
+        openCodeRemainingPercent(model.snapshot.openCodeWeekly, limit: 30)
+    }
+
+    private var openCodeMonthlyLeft: Double {
+        openCodeRemainingPercent(model.snapshot.openCodeMonthly, limit: 60)
+    }
+
     private var codexSecondaryLeft: Double? {
         model.snapshot.codexSecondaryLimit.map { 100 - $0 }
     }
@@ -1679,6 +1804,10 @@ struct UsagePanelView: View {
 
     private func openCodePercent(_ window: OpenCodeUsageWindow, limit: Double) -> Double {
         limit > 0 ? (window.cost / limit) * 100 : 0
+    }
+
+    private func openCodeRemainingPercent(_ window: OpenCodeUsageWindow, limit: Double) -> Double {
+        max(0, 100 - openCodePercent(window, limit: limit))
     }
 
     private func usageColor(for percent: Double) -> Color {

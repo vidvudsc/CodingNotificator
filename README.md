@@ -22,7 +22,7 @@ Coding Notificator watches local OpenCode, Codex, and Claude Code activity, show
 
 The menu bar panel keeps the app intentionally small:
 
-- **OpenCode**: `5h`, `Weekly`, and `Monthly` usage percentages.
+- **OpenCode**: `5h left`, `Weekly left`, and `Monthly left`.
 - **Codex**: `5h left` and `Weekly left`, with reset countdowns when Codex exposes them.
 - **Claude Code**: `5h left` and `7d left`, populated after Claude Code sends status-line data.
 - Progress bars shift from healthy green to warning amber to critical red.
