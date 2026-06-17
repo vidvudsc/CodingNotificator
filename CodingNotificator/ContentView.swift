@@ -1908,17 +1908,7 @@ struct UsageSectionView: View {
                                 .textSelection(.enabled)
                         }
 
-                        GeometryReader { geometry in
-                            ZStack(alignment: .leading) {
-                                Capsule()
-                                    .fill(Color.white.opacity(0.12))
-
-                                Capsule()
-                                    .fill(row.color)
-                                    .frame(width: geometry.size.width * min(1, max(0, row.progress)))
-                            }
-                        }
-                        .frame(height: 4)
+                        AnimatedUsageBar(progress: row.progress, color: row.color)
                     }
                 }
             }
@@ -1928,6 +1918,41 @@ struct UsageSectionView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.regularMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 7))
+    }
+}
+
+struct AnimatedUsageBar: View {
+    let progress: Double
+    let color: Color
+
+    @State private var displayedProgress: Double = 0
+
+    private var clampedProgress: Double {
+        min(1, max(0, progress))
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.white.opacity(0.12))
+
+                Capsule()
+                    .fill(color)
+                    .frame(width: geometry.size.width * displayedProgress)
+            }
+        }
+        .frame(height: 4)
+        .onAppear {
+            withAnimation(.smooth(duration: 0.55)) {
+                displayedProgress = clampedProgress
+            }
+        }
+        .onChange(of: clampedProgress) { _, newValue in
+            withAnimation(.smooth(duration: 0.55)) {
+                displayedProgress = newValue
+            }
+        }
     }
 }
 
