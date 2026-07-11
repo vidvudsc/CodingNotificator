@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Combine
 import Foundation
+import QuartzCore
 
 enum StatusMode {
     case idle
@@ -24,6 +25,33 @@ struct TokenUsage: Sendable {
         self.reasoning = reasoning
         self.cached = cached
         self.total = total
+    }
+}
+
+struct HourlyUsageActivity: Sendable {
+    enum Metric: Sendable {
+        case tokens
+        case requests
+    }
+
+    let values: [Double]
+    let metric: Metric
+
+    nonisolated init(values: [Double] = Array(repeating: 0, count: 24), metric: Metric = .tokens) {
+        if values.count == 24 {
+            self.values = values
+        } else {
+            self.values = Array(values.prefix(24)) + Array(repeating: 0, count: max(0, 24 - values.count))
+        }
+        self.metric = metric
+    }
+
+    var total: Double {
+        values.reduce(0, +)
+    }
+
+    var maximum: Double {
+        values.max() ?? 0
     }
 }
 
@@ -50,8 +78,10 @@ struct UsageSnapshot: Sendable {
     var openCodeFiveHour = OpenCodeUsageWindow()
     var openCodeWeekly = OpenCodeUsageWindow()
     var openCodeMonthly = OpenCodeUsageWindow()
+    var openCodeHourlyActivity = HourlyUsageActivity(metric: .tokens)
     var codexModel: String = "Not found"
     var codexTokens = TokenUsage()
+    var codexHourlyActivity = HourlyUsageActivity(metric: .tokens)
     var codexPrimaryLimit: Double?
     var codexSecondaryLimit: Double?
     var codexPrimaryResetAt: Date?
@@ -61,6 +91,7 @@ struct UsageSnapshot: Sendable {
     var claudeSevenDayLimit: Double?
     var claudeFiveHourResetAt: Date?
     var claudeSevenDayResetAt: Date?
+    var claudeHourlyActivity = HourlyUsageActivity(metric: .tokens)
     var claudeUpdatedAt: Date?
     var refreshedAt = Date()
 
@@ -73,8 +104,10 @@ struct UsageSnapshot: Sendable {
         openCodeFiveHour: OpenCodeUsageWindow = OpenCodeUsageWindow(),
         openCodeWeekly: OpenCodeUsageWindow = OpenCodeUsageWindow(),
         openCodeMonthly: OpenCodeUsageWindow = OpenCodeUsageWindow(),
+        openCodeHourlyActivity: HourlyUsageActivity = HourlyUsageActivity(metric: .tokens),
         codexModel: String = "Not found",
         codexTokens: TokenUsage = TokenUsage(),
+        codexHourlyActivity: HourlyUsageActivity = HourlyUsageActivity(metric: .tokens),
         codexPrimaryLimit: Double? = nil,
         codexSecondaryLimit: Double? = nil,
         codexPrimaryResetAt: Date? = nil,
@@ -84,6 +117,7 @@ struct UsageSnapshot: Sendable {
         claudeSevenDayLimit: Double? = nil,
         claudeFiveHourResetAt: Date? = nil,
         claudeSevenDayResetAt: Date? = nil,
+        claudeHourlyActivity: HourlyUsageActivity = HourlyUsageActivity(metric: .tokens),
         claudeUpdatedAt: Date? = nil,
         refreshedAt: Date = Date()
     ) {
@@ -95,8 +129,10 @@ struct UsageSnapshot: Sendable {
         self.openCodeFiveHour = openCodeFiveHour
         self.openCodeWeekly = openCodeWeekly
         self.openCodeMonthly = openCodeMonthly
+        self.openCodeHourlyActivity = openCodeHourlyActivity
         self.codexModel = codexModel
         self.codexTokens = codexTokens
+        self.codexHourlyActivity = codexHourlyActivity
         self.codexPrimaryLimit = codexPrimaryLimit
         self.codexSecondaryLimit = codexSecondaryLimit
         self.codexPrimaryResetAt = codexPrimaryResetAt
@@ -106,6 +142,7 @@ struct UsageSnapshot: Sendable {
         self.claudeSevenDayLimit = claudeSevenDayLimit
         self.claudeFiveHourResetAt = claudeFiveHourResetAt
         self.claudeSevenDayResetAt = claudeSevenDayResetAt
+        self.claudeHourlyActivity = claudeHourlyActivity
         self.claudeUpdatedAt = claudeUpdatedAt
         self.refreshedAt = refreshedAt
     }
@@ -155,6 +192,12 @@ private nonisolated final class CodexAppServerResponseBuffer: @unchecked Sendabl
 
 actor UsageReader {
     private let home = FileManager.default.homeDirectoryForCurrentUser
+    private let iso8601FractionalFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    private let iso8601Formatter = ISO8601DateFormatter()
     private var cachedSnapshot: UsageSnapshot?
     private var cachedAt: Date?
 
@@ -171,6 +214,9 @@ actor UsageReader {
         readOpenCodeUsage(into: &snapshot)
         readCodexUsage(into: &snapshot)
         readClaudeUsage(into: &snapshot)
+        snapshot.openCodeHourlyActivity = readOpenCodeHourlyActivity()
+        snapshot.codexHourlyActivity = readCodexHourlyActivity()
+        snapshot.claudeHourlyActivity = readClaudeHourlyActivity()
         carryForwardCodexUsageIfNeeded(from: previousSnapshot, into: &snapshot)
         carryForwardClaudeUsageIfNeeded(from: previousSnapshot, into: &snapshot)
         snapshot.refreshedAt = Date()
@@ -284,6 +330,156 @@ actor UsageReader {
             + snapshot.openCodeTokens.output
             + snapshot.openCodeTokens.reasoning
         snapshot.openCodeWeekly.resetAt = nextWeekStart
+    }
+
+    private func readOpenCodeHourlyActivity() -> HourlyUsageActivity {
+        let databaseURL = home.appendingPathComponent(".local/share/opencode/opencode.db")
+        if FileManager.default.fileExists(atPath: databaseURL.path) {
+            let sql = """
+            with assistant as (
+              select time_updated/1000.0 as ts,
+                     coalesce(cast(json_extract(a.data,'$.tokens.input') as integer),0)
+                       + coalesce(cast(json_extract(a.data,'$.tokens.output') as integer),0)
+                       + coalesce(cast(json_extract(a.data,'$.tokens.reasoning') as integer),0) as tokens,
+                     json_extract(u.data,'$.model.providerID') as provider
+              from message a
+              left join message u on u.id = json_extract(a.data,'$.parentID')
+              where json_extract(a.data,'$.role')='assistant'
+            )
+            select cast((ts - (strftime('%s','now') - 86400))/3600 as integer),
+                   coalesce(sum(case when tokens > 0 then tokens else 1 end),0)
+            from assistant
+            where provider='opencode-go'
+              and ts >= strftime('%s','now') - 86400
+            group by 1
+            order by 1;
+            """
+
+            return hourlyActivity(from: runSQLiteQuery(databaseURL: databaseURL, sql: sql, timeout: 0.8))
+        }
+
+        var values = Array(repeating: 0.0, count: 24)
+        let messageURL = home.appendingPathComponent(".local/share/opencode/storage/message")
+        guard let enumerator = FileManager.default.enumerator(
+            at: messageURL,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return HourlyUsageActivity(values: values, metric: .tokens)
+        }
+
+        let now = Date()
+        for case let fileURL as URL in enumerator where fileURL.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: fileURL),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  object["role"] as? String == "assistant" else {
+                continue
+            }
+
+            let time = object["time"] as? [String: Any]
+            let millis = intValue(time?["completed"] ?? time?["created"])
+            let modifiedAt = (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            let date = millis > 0 ? Date(timeIntervalSince1970: TimeInterval(millis) / 1000) : modifiedAt ?? .distantPast
+            guard let index = hourlyActivityIndex(for: date, now: now) else { continue }
+
+            let tokens = openCodeTokens(from: object).total
+            values[index] += Double(max(1, tokens))
+        }
+
+        return HourlyUsageActivity(values: values, metric: .tokens)
+    }
+
+    private func hourlyActivity(from output: String?) -> HourlyUsageActivity {
+        var values = Array(repeating: 0.0, count: 24)
+        guard let output, !output.isEmpty else { return HourlyUsageActivity(values: values, metric: .tokens) }
+
+        for line in output.split(whereSeparator: \.isNewline) {
+            let columns = line.split(separator: "\t", omittingEmptySubsequences: false)
+            guard columns.count >= 2,
+                  let index = Int(columns[0]),
+                  values.indices.contains(index),
+                  let amount = Double(columns[1]) else {
+                continue
+            }
+
+            values[index] += max(1, amount)
+        }
+
+        return HourlyUsageActivity(values: values, metric: .tokens)
+    }
+
+    private func hourlyActivityIndex(for date: Date, now: Date) -> Int? {
+        let age = now.timeIntervalSince(date)
+        guard age >= 0, age < 24 * 60 * 60 else { return nil }
+        return min(23, max(0, Int((24 * 60 * 60 - age) / (60 * 60))))
+    }
+
+    private func readCodexHourlyActivity() -> HourlyUsageActivity {
+        var values = Array(repeating: 0.0, count: 24)
+        let now = Date()
+
+        for file in codexSessionFiles(limit: 24) {
+            guard let contents = tailString(from: file.url, maxBytes: 500_000) else { continue }
+
+            for line in contents.split(whereSeparator: \.isNewline) {
+                guard line.contains("\"token_count\""),
+                      let data = String(line).data(using: .utf8),
+                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      object["type"] as? String == "event_msg",
+                      let payload = object["payload"] as? [String: Any],
+                      payload["type"] as? String == "token_count",
+                      let eventDate = dateValue(object["timestamp"]),
+                      let index = hourlyActivityIndex(for: eventDate, now: now),
+                      let info = payload["info"] as? [String: Any],
+                      let lastUsage = info["last_token_usage"] as? [String: Any] else {
+                    continue
+                }
+
+                let tokens = intValue(lastUsage["total_tokens"])
+                values[index] += Double(max(1, tokens))
+            }
+        }
+
+        return HourlyUsageActivity(values: values, metric: .tokens)
+    }
+
+    private func readClaudeHourlyActivity() -> HourlyUsageActivity {
+        var values = Array(repeating: 0.0, count: 24)
+        let now = Date()
+        let projectsURL = home.appendingPathComponent(".claude/projects", isDirectory: true)
+        let files = jsonlFiles(in: projectsURL)
+            .filter { ($0.modifiedAt ?? .distantPast) >= now.addingTimeInterval(-24 * 60 * 60) }
+            .sorted { ($0.modifiedAt ?? .distantPast) > ($1.modifiedAt ?? .distantPast) }
+            .prefix(40)
+
+        for file in files {
+            guard let contents = tailString(from: file.url, maxBytes: 500_000) else { continue }
+
+            for line in contents.split(whereSeparator: \.isNewline) {
+                guard let data = String(line).data(using: .utf8),
+                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      object["type"] as? String == "assistant",
+                      let eventDate = dateValue(object["timestamp"]),
+                      let index = hourlyActivityIndex(for: eventDate, now: now),
+                      let message = object["message"] as? [String: Any],
+                      let usage = (object["usage"] as? [String: Any]) ?? (message["usage"] as? [String: Any]) else {
+                    continue
+                }
+
+                let tokens = claudeTokenCount(from: usage)
+                guard tokens > 0 else { continue }
+                values[index] += Double(tokens)
+            }
+        }
+
+        return HourlyUsageActivity(values: values, metric: .tokens)
+    }
+
+    private func claudeTokenCount(from usage: [String: Any]) -> Int {
+        intValue(usage["input_tokens"])
+            + intValue(usage["output_tokens"])
+            + intValue(usage["cache_creation_input_tokens"])
+            + intValue(usage["cache_read_input_tokens"])
     }
 
     private func readOpenCodeUsageFromDatabase(into snapshot: inout UsageSnapshot) -> Bool {
@@ -491,22 +687,35 @@ actor UsageReader {
     }
 
     private func readClaudeUsage(into snapshot: inout UsageSnapshot) {
+        var cachedSnapshot = UsageSnapshot()
+        let hasCachedUsage = readClaudeUsageFromCache(into: &cachedSnapshot)
+
         if readClaudeUsageFromCommand(into: &snapshot) {
+            mergeMissingClaudeUsage(from: cachedSnapshot, into: &snapshot, hasCachedUsage: hasCachedUsage)
             return
         }
 
+        if hasCachedUsage {
+            mergeMissingClaudeUsage(from: cachedSnapshot, into: &snapshot, hasCachedUsage: true)
+        }
+    }
+
+    private func readClaudeUsageFromCache(into snapshot: inout UsageSnapshot) -> Bool {
         let cacheURL = codingNotificatorSupportURL().appendingPathComponent("claude-usage.json")
         guard let data = try? Data(contentsOf: cacheURL),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let rateLimits = object["rate_limits"] as? [String: Any] else {
-            return
+            return false
         }
+
+        var foundUsage = false
 
         if let fiveHour = rateLimits["five_hour"] as? [String: Any],
            let usedPercent = doubleValue(fiveHour["used_percentage"]) {
             let resetAt = unixDate(from: fiveHour["resets_at"])
             snapshot.claudeFiveHourLimit = activeCachedUsedPercent(usedPercent, resetAt: resetAt)
             snapshot.claudeFiveHourResetAt = resetAt
+            foundUsage = true
         }
 
         if let sevenDay = rateLimits["seven_day"] as? [String: Any],
@@ -514,10 +723,43 @@ actor UsageReader {
             let resetAt = unixDate(from: sevenDay["resets_at"])
             snapshot.claudeSevenDayLimit = activeCachedUsedPercent(usedPercent, resetAt: resetAt)
             snapshot.claudeSevenDayResetAt = resetAt
+            foundUsage = true
         }
 
-        let values = try? cacheURL.resourceValues(forKeys: [.contentModificationDateKey])
-        snapshot.claudeUpdatedAt = values?.contentModificationDate ?? Date()
+        if foundUsage {
+            let values = try? cacheURL.resourceValues(forKeys: [.contentModificationDateKey])
+            snapshot.claudeUpdatedAt = values?.contentModificationDate ?? Date()
+        }
+
+        return foundUsage
+    }
+
+    private func mergeMissingClaudeUsage(from cachedSnapshot: UsageSnapshot, into snapshot: inout UsageSnapshot, hasCachedUsage: Bool) {
+        guard hasCachedUsage else { return }
+
+        if snapshot.claudeFiveHourLimit == nil {
+            snapshot.claudeFiveHourLimit = cachedSnapshot.claudeFiveHourLimit
+        }
+
+        if snapshot.claudeSevenDayLimit == nil {
+            snapshot.claudeSevenDayLimit = cachedSnapshot.claudeSevenDayLimit
+        }
+
+        if snapshot.claudeFiveHourResetAt == nil,
+           let cachedResetAt = cachedSnapshot.claudeFiveHourResetAt,
+           cachedResetAt > Date() {
+            snapshot.claudeFiveHourResetAt = cachedResetAt
+        }
+
+        if snapshot.claudeSevenDayResetAt == nil,
+           let cachedResetAt = cachedSnapshot.claudeSevenDayResetAt,
+           cachedResetAt > Date() {
+            snapshot.claudeSevenDayResetAt = cachedResetAt
+        }
+
+        if snapshot.claudeUpdatedAt == nil {
+            snapshot.claudeUpdatedAt = cachedSnapshot.claudeUpdatedAt
+        }
     }
 
     private func readClaudeUsageFromCommand(into snapshot: inout UsageSnapshot) -> Bool {
@@ -904,7 +1146,8 @@ actor UsageReader {
 
     private func dateValue(_ value: Any?) -> Date? {
         guard let string = value as? String else { return nil }
-        return ISO8601DateFormatter().date(from: string)
+        return iso8601FractionalFormatter.date(from: string)
+            ?? iso8601Formatter.date(from: string)
     }
 
     private func resetDate(from object: [String: Any]) -> Date? {
@@ -953,7 +1196,7 @@ actor UsageReader {
 @MainActor
 final class UsagePanelModel: ObservableObject {
     @Published var snapshot = UsageSnapshot()
-    @Published var isLoading = false
+    @Published var isLoading = true
     private static let reader = UsageReader()
     private var refreshTask: Task<Void, Never>?
 
@@ -1345,10 +1588,11 @@ final class NotchNotifierModel: ObservableObject {
 
         switch mode {
         case .done, .needsInput, .failed:
-            overlayController?.hide()
-            mode = .idle
-            isBusy = false
-            print("overlay dismissed")
+            overlayController?.hide { [weak self] in
+                self?.mode = .idle
+                self?.isBusy = false
+                print("overlay dismissed")
+            }
         default:
             print("dismiss ignored")
         }
@@ -1412,9 +1656,10 @@ final class NotchNotifierModel: ObservableObject {
             )
 
         case "hide":
-            overlayController?.hide()
-            mode = .idle
-            isBusy = false
+            overlayController?.hide { [weak self] in
+                self?.mode = .idle
+                self?.isBusy = false
+            }
 
         default:
             print("Unknown event:", event)
@@ -1518,7 +1763,7 @@ final class NotchNotifierModel: ObservableObject {
         }
 
         let assistantMessage = textValue(for: "last-assistant-message", in: payload)
-        if looksLikeCodexTitleResponse(assistantMessage) {
+        if isCodexInternalJSONResponse(assistantMessage) {
             return false
         }
 
@@ -1567,13 +1812,23 @@ final class NotchNotifierModel: ObservableObject {
             || normalized.contains("the tasks typically have to do with coding-related tasks")
             || normalized.contains("fill the structured title field")
             || normalized.contains("do not respond to the user")
+            || normalized.contains("generate 0 to 3 hyperpersonalized suggestions")
+            || normalized.contains("codex ambient suggestions")
+            || normalized.contains("upholding safety and compliance standards for codex ambient suggestions")
+            || normalized.contains("you will be presented with a user prompt, and your job is to provide a short title")
+            || normalized.contains("respond directly to the user's prompt. do not run shell commands")
     }
 
-    private func looksLikeCodexTitleResponse(_ text: String) -> Bool {
+    private func isCodexInternalJSONResponse(_ text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.hasPrefix("{\"title\"")
-            || trimmed.hasPrefix("{\n  \"title\"")
-            || trimmed.hasPrefix("{\n    \"title\"")
+        guard let data = trimmed.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+
+        let internalKeys: Set<String> = ["title", "suggestions", "exclude"]
+        let keys = Set(object.keys)
+        return !keys.isEmpty && keys.isSubset(of: internalKeys)
     }
 
     private func showRunning(title: String, message: String) {
@@ -1693,6 +1948,8 @@ struct UsagePanelView: View {
 
             UsageSectionView(
                 title: "OpenCode",
+                activity: model.snapshot.openCodeHourlyActivity,
+                activityColor: Color(red: 0.30, green: 0.78, blue: 0.96),
                 rows: [
                     remainingRow(
                         "5h left",
@@ -1714,6 +1971,8 @@ struct UsagePanelView: View {
 
             UsageSectionView(
                 title: "Codex",
+                activity: model.snapshot.codexHourlyActivity,
+                activityColor: Color(red: 0.45, green: 0.55, blue: 1.00),
                 rows: [
                     remainingRow(
                         "5h left",
@@ -1730,6 +1989,8 @@ struct UsagePanelView: View {
 
             UsageSectionView(
                 title: "Claude Code",
+                activity: model.snapshot.claudeHourlyActivity,
+                activityColor: Color(red: 1.00, green: 0.63, blue: 0.28),
                 rows: [
                     remainingRow(
                         "5h left",
@@ -1791,6 +2052,15 @@ struct UsagePanelView: View {
 
     private func remainingRow(_ label: String, remainingPercent: Double?, resetAt: Date?) -> UsageDisplayRow {
         guard let remainingPercent else {
+            if model.isLoading {
+                return UsageDisplayRow(
+                    label: label,
+                    value: "100%",
+                    progress: 1,
+                    color: remainingColor(for: 100)
+                )
+            }
+
             return UsageDisplayRow(label: label, value: "n/a", progress: 0, color: .secondary)
         }
 
@@ -1877,8 +2147,12 @@ struct UsageDisplayRow {
 
 struct UsageSectionView: View {
     let title: String
+    let activity: HourlyUsageActivity
+    let activityColor: Color
     var subtitle: String? = nil
     let rows: [UsageDisplayRow]
+
+    @State private var hoveredActivityText: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1886,12 +2160,17 @@ struct UsageSectionView: View {
                 Text(title)
                     .font(.caption.weight(.semibold))
 
-                if let subtitle {
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
+                Text(hoveredActivityText ?? subtitle ?? "")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                    .opacity(hoveredActivityText == nil && subtitle == nil ? 0 : 1)
+                    .frame(height: 13, alignment: .leading)
+            }
+
+            UsageActivityStrip(activity: activity, color: activityColor) { text in
+                hoveredActivityText = text
             }
 
             VStack(spacing: 5) {
@@ -1921,11 +2200,94 @@ struct UsageSectionView: View {
     }
 }
 
+struct UsageActivityStrip: View {
+    let activity: HourlyUsageActivity
+    let color: Color
+    let onHoverTextChanged: (String?) -> Void
+
+    @State private var displayedValues = Array(repeating: 0.0, count: 24)
+    @State private var hoveredIndex: Int?
+
+    private var maximum: Double {
+        max(activity.maximum, 1)
+    }
+
+    private var targetValues: [Double] {
+        guard activity.total > 0 else {
+            return Array(repeating: 0, count: 24)
+        }
+
+        return activity.values.map { min(1, max(0, $0 / maximum)) }
+    }
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            HStack(alignment: .bottom, spacing: 2) {
+                ForEach(Array(displayedValues.enumerated()), id: \.offset) { index, value in
+                    RoundedRectangle(cornerRadius: 1.5)
+                        .fill(value > 0 ? color.opacity(0.92) : Color.white.opacity(0.10))
+                        .frame(maxWidth: .infinity)
+                        .frame(height: value > 0 ? max(3, 24 * CGFloat(value)) : 3)
+                        .scaleEffect(
+                            x: hoveredIndex == index ? 1.18 : 1,
+                            y: hoveredIndex == index ? 1.10 : 1,
+                            anchor: .bottom
+                        )
+                        .contentShape(Rectangle())
+                        .onHover { isHovering in
+                            withAnimation(.easeOut(duration: 0.10)) {
+                                hoveredIndex = isHovering ? index : (hoveredIndex == index ? nil : hoveredIndex)
+                                onHoverTextChanged(isHovering ? tooltip(for: index, value: activity.values[index]) : nil)
+                            }
+                        }
+                        .zIndex(hoveredIndex == index ? 1 : 0)
+                }
+            }
+        }
+        .frame(height: 24, alignment: .bottom)
+        .animation(.easeOut(duration: 0.10), value: hoveredIndex)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Hourly usage during the last 24 hours")
+        .accessibilityValue(activity.total > 0 ? "Activity recorded" : "No activity recorded")
+        .onAppear {
+            animate(to: targetValues)
+        }
+        .onChange(of: targetValues) { _, newValue in
+            animate(to: newValue)
+        }
+    }
+
+    private func animate(to values: [Double]) {
+        withAnimation(.smooth(duration: 0.55)) {
+            displayedValues = values
+        }
+    }
+
+    private func tooltip(for index: Int, value: Double) -> String {
+        let now = Date()
+        let start = now.addingTimeInterval(-24 * 60 * 60 + Double(index) * 60 * 60)
+        let formatter = DateFormatter()
+        formatter.locale = Locale.current
+        formatter.dateFormat = "HH:mm"
+
+        let amount = value.formatted(.number.notation(.compactName).precision(.fractionLength(0)))
+        let unit: String
+        switch activity.metric {
+        case .tokens:
+            unit = "tokens"
+        case .requests:
+            unit = value == 1 ? "request" : "requests"
+        }
+
+        return "\(formatter.string(from: start)) · \(amount) \(unit)"
+    }
+}
+
 struct AnimatedUsageBar: View {
     let progress: Double
     let color: Color
 
-    @State private var displayedProgress: Double = 0
+    @State private var displayedProgress: Double = 1
 
     private var clampedProgress: Double {
         min(1, max(0, progress))
@@ -2133,6 +2495,10 @@ struct OverlayIslandView: View {
 final class NotchOverlayController {
     private let panel: NSPanel
     private var currentMode: StatusMode = .idle
+    private var hideWorkItem: DispatchWorkItem?
+
+    private let showDuration: TimeInterval = 0.28
+    private let hideDuration: TimeInterval = 0.22
 
     init(rootView: some View) {
         let metrics = NSScreen.main?.readNotchMetrics() ?? .fallback
@@ -2181,35 +2547,64 @@ final class NotchOverlayController {
     }
 
     func show(mode: StatusMode) {
+        hideWorkItem?.cancel()
+        hideWorkItem = nil
+
         currentMode = mode
 
-        NSAnimationContext.beginGrouping()
-        NSAnimationContext.current.duration = 0
-        repositionForCurrentMode()
-        NSAnimationContext.endGrouping()
+        let visibleFrame = frame(for: currentMode, hidden: false)
+        let hiddenFrame = frame(for: currentMode, hidden: true)
 
         panel.ignoresMouseEvents = (mode == .idle || mode == .running)
         print("panel show mode =", mode, "ignoresMouseEvents =", panel.ignoresMouseEvents)
 
-        panel.orderFrontRegardless()
+        if !panel.isVisible {
+            panel.setFrame(hiddenFrame, display: true)
+            panel.orderFrontRegardless()
+        }
+
+        animatePanel(to: visibleFrame, duration: showDuration)
     }
 
-    func hide() {
-        panel.orderOut(nil)
+    func hide(completion: (@MainActor () -> Void)? = nil) {
+        hideWorkItem?.cancel()
+
+        let hiddenFrame = frame(for: currentMode, hidden: true)
+        animatePanel(to: hiddenFrame, duration: hideDuration)
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.panel.orderOut(nil)
+            Task { @MainActor in
+                completion?()
+            }
+        }
+
+        hideWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + hideDuration, execute: workItem)
     }
 
     private func repositionForCurrentMode() {
-        let metrics = NSScreen.main?.readNotchMetrics() ?? .fallback
-        let layout = IslandLayout.forMode(currentMode, notchWidth: metrics.notchWidth)
+        panel.setFrame(frame(for: currentMode, hidden: !panel.isVisible), display: true)
+    }
 
-        let newFrame = NSRect(
+    private func frame(for mode: StatusMode, hidden: Bool) -> NSRect {
+        let metrics = NSScreen.main?.readNotchMetrics() ?? .fallback
+        let layout = IslandLayout.forMode(mode, notchWidth: metrics.notchWidth)
+
+        return NSRect(
             x: metrics.screenFrame.midX - (layout.width / 2),
-            y: metrics.screenFrame.maxY - layout.height,
+            y: hidden ? metrics.screenFrame.maxY : metrics.screenFrame.maxY - layout.height,
             width: layout.width,
             height: layout.height
         )
+    }
 
-        panel.setFrame(newFrame, display: true)
+    private func animatePanel(to frame: NSRect, duration: TimeInterval) {
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = duration
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().setFrame(frame, display: true)
+        }
     }
 }
 
