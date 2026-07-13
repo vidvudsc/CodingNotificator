@@ -1,6 +1,5 @@
 import SwiftUI
 import AppKit
-import Charts
 import Combine
 import Foundation
 import QuartzCore
@@ -51,14 +50,12 @@ struct HourlyUsageActivity: Sendable {
     let metric: Metric
     let models: [String?]
     let costs: [Double?]
-    let reasoningModes: [String?]
 
     nonisolated init(
         values: [Double] = Array(repeating: 0, count: 24),
         metric: Metric = .tokens,
         models: [String?] = Array(repeating: nil, count: 24),
-        costs: [Double?] = Array(repeating: nil, count: 24),
-        reasoningModes: [String?] = Array(repeating: nil, count: 24)
+        costs: [Double?] = Array(repeating: nil, count: 24)
     ) {
         if values.count == 24 {
             self.values = values
@@ -68,8 +65,6 @@ struct HourlyUsageActivity: Sendable {
         self.metric = metric
         self.models = Array(models.prefix(24)) + Array(repeating: nil, count: max(0, 24 - models.count))
         self.costs = Array(costs.prefix(24)) + Array(repeating: nil, count: max(0, 24 - costs.count))
-        self.reasoningModes = Array(reasoningModes.prefix(24))
-            + Array(repeating: nil, count: max(0, 24 - reasoningModes.count))
     }
 
     var total: Double {
@@ -78,45 +73,6 @@ struct HourlyUsageActivity: Sendable {
 
     var maximum: Double {
         values.max() ?? 0
-    }
-
-    var estimatedCost: Double? {
-        let knownCosts = costs.compactMap { $0 }
-        guard !knownCosts.isEmpty else { return nil }
-        return knownCosts.reduce(0, +)
-    }
-
-    var dominantModel: String? {
-        var totals: [String: Double] = [:]
-
-        for (index, model) in models.enumerated() {
-            guard let model,
-                  !model.isEmpty,
-                  model != "Unknown",
-                  values.indices.contains(index) else {
-                continue
-            }
-
-            totals[model, default: 0] += values[index]
-        }
-
-        return totals.max(by: { $0.value < $1.value })?.key
-    }
-
-    var dominantReasoningMode: String? {
-        var totals: [String: Double] = [:]
-
-        for (index, mode) in reasoningModes.enumerated() {
-            guard let mode,
-                  !mode.isEmpty,
-                  values.indices.contains(index) else {
-                continue
-            }
-
-            totals[mode, default: 0] += values[index]
-        }
-
-        return totals.max(by: { $0.value < $1.value })?.key
     }
 }
 
@@ -345,8 +301,9 @@ actor UsageReader {
         var latestDate = Date.distantPast
         let now = Date()
         let fiveHourStart = now.addingTimeInterval(-5 * 60 * 60)
-        let weeklyStart = now.addingTimeInterval(-7 * 24 * 60 * 60)
+        let weeklyStart = Date(timeIntervalSince1970: TimeInterval(startOfCurrentWeek(for: now)))
         let monthlyStart = now.addingTimeInterval(-30 * 24 * 60 * 60)
+        let nextWeekStart = startOfNextWeek(for: now)
 
         for case let fileURL as URL in enumerator where fileURL.pathExtension == "json" {
             guard let data = try? Data(contentsOf: fileURL),
@@ -394,6 +351,7 @@ actor UsageReader {
         snapshot.openCodeTokens.total = snapshot.openCodeTokens.input
             + snapshot.openCodeTokens.output
             + snapshot.openCodeTokens.reasoning
+        snapshot.openCodeWeekly.resetAt = nextWeekStart
     }
 
     private func readOpenCodeHourlyActivity() -> HourlyUsageActivity {
@@ -500,15 +458,12 @@ actor UsageReader {
         var values = Array(repeating: 0.0, count: 24)
         var models = Array<String?>(repeating: nil, count: 24)
         var costs = Array<Double?>(repeating: nil, count: 24)
-        var reasoningModes = Array<String?>(repeating: nil, count: 24)
         var modelTokenTotals = Array(repeating: 0.0, count: 24)
-        var reasoningTokenTotals = Array(repeating: 0.0, count: 24)
         let now = Date()
 
         for file in codexSessionFiles(limit: 24) {
             guard let contents = tailString(from: file.url, maxBytes: 500_000) else { continue }
             let fallbackModel = latestModel(in: contents) ?? "Codex"
-            let reasoningMode = latestReasoningMode(in: contents)
 
             for line in contents.split(whereSeparator: \.isNewline) {
                 guard line.contains("\"token_count\""),
@@ -540,30 +495,17 @@ actor UsageReader {
                     modelTokenTotals[index] = normalizedTokens
                     models[index] = model
                 }
-
-                if let reasoningMode, normalizedTokens > reasoningTokenTotals[index] {
-                    reasoningTokenTotals[index] = normalizedTokens
-                    reasoningModes[index] = reasoningMode
-                }
             }
         }
 
-        return HourlyUsageActivity(
-            values: values,
-            metric: .tokens,
-            models: models,
-            costs: costs,
-            reasoningModes: reasoningModes
-        )
+        return HourlyUsageActivity(values: values, metric: .tokens, models: models, costs: costs)
     }
 
     private func readClaudeHourlyActivity() -> HourlyUsageActivity {
         var values = Array(repeating: 0.0, count: 24)
         var models = Array<String?>(repeating: nil, count: 24)
         var costs = Array<Double?>(repeating: nil, count: 24)
-        var reasoningModes = Array<String?>(repeating: nil, count: 24)
         var modelTokenTotals = Array(repeating: 0.0, count: 24)
-        var reasoningTokenTotals = Array(repeating: 0.0, count: 24)
         let now = Date()
         let projectsURL = home.appendingPathComponent(".claude/projects", isDirectory: true)
         let files = jsonlFiles(in: projectsURL)
@@ -606,25 +548,10 @@ actor UsageReader {
                     modelTokenTotals[index] = normalizedTokens
                     models[index] = model
                 }
-
-                let content = message["content"] as? [[String: Any]] ?? []
-                let reasoningMode = content.contains { $0["type"] as? String == "thinking" }
-                    ? "Thinking"
-                    : "Standard"
-                if normalizedTokens > reasoningTokenTotals[index] {
-                    reasoningTokenTotals[index] = normalizedTokens
-                    reasoningModes[index] = reasoningMode
-                }
             }
         }
 
-        return HourlyUsageActivity(
-            values: values,
-            metric: .tokens,
-            models: models,
-            costs: costs,
-            reasoningModes: reasoningModes
-        )
+        return HourlyUsageActivity(values: values, metric: .tokens, models: models, costs: costs)
     }
 
     private func claudeTokenCount(from usage: [String: Any]) -> Int {
@@ -694,7 +621,7 @@ actor UsageReader {
 
         let now = Date()
         let fiveHourStart = Int(now.timeIntervalSince1970) - 5 * 60 * 60
-        let weeklyStart = Int(now.timeIntervalSince1970) - 7 * 24 * 60 * 60
+        let weeklyStart = startOfCurrentWeek(for: now)
         let monthlyStart = Int(now.timeIntervalSince1970) - 30 * 24 * 60 * 60
 
         let usageSQL = """
@@ -767,10 +694,24 @@ actor UsageReader {
             total: intValue(values[6])
         )
         snapshot.openCodeFiveHour = openCodeWindow(from: values, start: 7, resetOffset: 5 * 60 * 60)
-        snapshot.openCodeWeekly = openCodeWindow(from: values, start: 15)
+        snapshot.openCodeWeekly = openCodeWindow(from: values, start: 15, resetAt: startOfNextWeek(for: now))
         snapshot.openCodeMonthly = openCodeWindow(from: values, start: 23, resetOffset: 30 * 24 * 60 * 60)
 
         return true
+    }
+
+    private func startOfCurrentWeek(for date: Date) -> Int {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        calendar.firstWeekday = 2
+
+        let start = calendar.dateInterval(of: .weekOfYear, for: date)?.start ?? date
+        return Int(start.timeIntervalSince1970)
+    }
+
+    private func startOfNextWeek(for date: Date) -> Date {
+        let weekStart = Date(timeIntervalSince1970: TimeInterval(startOfCurrentWeek(for: date)))
+        return weekStart.addingTimeInterval(7 * 24 * 60 * 60)
     }
 
     private func openCodeWindow(from values: [String], start: Int, resetOffset: TimeInterval? = nil, resetAt: Date? = nil) -> OpenCodeUsageWindow {
@@ -1050,8 +991,11 @@ actor UsageReader {
     }
 
     private func readCodexUsage(into snapshot: inout UsageSnapshot) {
-        let hasLiveRateLimits = readCodexUsageFromAppServer(into: &snapshot)
-        readCodexUsageFromSessionFiles(into: &snapshot, includeRateLimits: !hasLiveRateLimits)
+        if readCodexUsageFromAppServer(into: &snapshot) {
+            return
+        }
+
+        readCodexUsageFromSessionFiles(into: &snapshot)
     }
 
     private func readCodexUsageFromAppServer(into snapshot: inout UsageSnapshot) -> Bool {
@@ -1070,25 +1014,15 @@ actor UsageReader {
 
             if let primary = rateLimits["primary"] as? [String: Any],
                let usedPercent = doubleValue(primary["usedPercent"] ?? primary["used_percent"]) {
-                applyCodexRateLimit(
-                    usedPercent: clampedPercent(usedPercent),
-                    resetAt: appServerResetDate(from: primary),
-                    rateLimit: primary,
-                    fallback: .fiveHour,
-                    to: &snapshot
-                )
+                snapshot.codexPrimaryLimit = clampedPercent(usedPercent)
+                snapshot.codexPrimaryResetAt = appServerResetDate(from: primary)
                 foundRateLimit = true
             }
 
             if let secondary = rateLimits["secondary"] as? [String: Any],
                let usedPercent = doubleValue(secondary["usedPercent"] ?? secondary["used_percent"]) {
-                applyCodexRateLimit(
-                    usedPercent: clampedPercent(usedPercent),
-                    resetAt: appServerResetDate(from: secondary),
-                    rateLimit: secondary,
-                    fallback: .weekly,
-                    to: &snapshot
-                )
+                snapshot.codexSecondaryLimit = clampedPercent(usedPercent)
+                snapshot.codexSecondaryResetAt = appServerResetDate(from: secondary)
                 foundRateLimit = true
             }
 
@@ -1166,16 +1100,13 @@ actor UsageReader {
             .first { FileManager.default.isExecutableFile(atPath: $0.path) }
     }
 
-    private func readCodexUsageFromSessionFiles(into snapshot: inout UsageSnapshot, includeRateLimits: Bool) {
+    private func readCodexUsageFromSessionFiles(into snapshot: inout UsageSnapshot) {
         let files = codexSessionFiles(limit: 8)
 
         var latestEventDate = Date.distantPast
 
         for file in files {
             guard let contents = tailString(from: file.url, maxBytes: 300_000) else { continue }
-            if let model = latestModel(in: contents) {
-                snapshot.codexModel = model
-            }
 
             for line in contents.split(whereSeparator: \.isNewline).reversed() {
                 guard line.contains("\"token_count\""),
@@ -1205,28 +1136,18 @@ actor UsageReader {
                     snapshot.codexTokens.total = intValue(usage["total_tokens"])
                 }
 
-                if includeRateLimits {
-                    if let primary = rateLimits["primary"] as? [String: Any],
-                       let usedPercent = doubleValue(primary["used_percent"]) {
-                        applyCodexRateLimit(
-                            usedPercent: activeUsedPercent(usedPercent, rateLimit: primary, eventDate: eventDate),
-                            resetAt: resetDate(from: primary),
-                            rateLimit: primary,
-                            fallback: .fiveHour,
-                            to: &snapshot
-                        )
-                    }
+                if let primary = rateLimits["primary"] as? [String: Any],
+                   let usedPercent = doubleValue(primary["used_percent"]) {
+                    let resetAt = resetDate(from: primary)
+                    snapshot.codexPrimaryLimit = activeUsedPercent(usedPercent, rateLimit: primary, eventDate: eventDate)
+                    snapshot.codexPrimaryResetAt = resetAt
+                }
 
-                    if let secondary = rateLimits["secondary"] as? [String: Any],
-                       let usedPercent = doubleValue(secondary["used_percent"]) {
-                        applyCodexRateLimit(
-                            usedPercent: activeUsedPercent(usedPercent, rateLimit: secondary, eventDate: eventDate),
-                            resetAt: resetDate(from: secondary),
-                            rateLimit: secondary,
-                            fallback: .weekly,
-                            to: &snapshot
-                        )
-                    }
+                if let secondary = rateLimits["secondary"] as? [String: Any],
+                   let usedPercent = doubleValue(secondary["used_percent"]) {
+                    let resetAt = resetDate(from: secondary)
+                    snapshot.codexSecondaryLimit = activeUsedPercent(usedPercent, rateLimit: secondary, eventDate: eventDate)
+                    snapshot.codexSecondaryResetAt = resetAt
                 }
 
                 break
@@ -1284,41 +1205,13 @@ actor UsageReader {
         for line in contents.split(whereSeparator: \.isNewline).reversed() {
             guard line.contains("\"model\""),
                   let data = String(line).data(using: .utf8),
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                continue
-            }
-
-            if let model = object["model"] as? String {
-                return model
-            }
-
-            if let payload = object["payload"] as? [String: Any],
-               let model = payload["model"] as? String {
-                return model
-            }
-        }
-
-        return nil
-    }
-
-    private func latestReasoningMode(in contents: String) -> String? {
-        for line in contents.split(whereSeparator: \.isNewline).reversed() {
-            guard line.contains("\"effort\""),
-                  let data = String(line).data(using: .utf8),
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let payload = object["payload"] as? [String: Any],
-                  let effort = payload["effort"] as? String else {
+                  let model = payload["model"] as? String else {
                 continue
             }
 
-            switch effort.lowercased() {
-            case "xhigh": return "X-High"
-            case "high": return "High"
-            case "medium": return "Medium"
-            case "low": return "Low"
-            case "minimal": return "Minimal"
-            default: return effort.capitalized
-            }
+            return model
         }
 
         return nil
@@ -1407,55 +1300,13 @@ actor UsageReader {
 
         guard resetAt > Date() else { return 0 }
 
-        let windowMinutes = codexWindowMinutes(from: rateLimit)
+        let windowMinutes = doubleValue(rateLimit["window_minutes"]) ?? 0
         if windowMinutes > 0 {
             let windowStart = resetAt.addingTimeInterval(-windowMinutes * 60)
             guard eventDate >= windowStart.addingTimeInterval(-60) else { return 0 }
         }
 
         return usedPercent
-    }
-
-    private enum CodexLimitSlot {
-        case fiveHour
-        case weekly
-    }
-
-    private func codexWindowMinutes(from rateLimit: [String: Any]) -> Double {
-        doubleValue(
-            rateLimit["windowMinutes"]
-                ?? rateLimit["window_minutes"]
-                ?? rateLimit["windowDurationMins"]
-                ?? rateLimit["window_duration_mins"]
-        ) ?? 0
-    }
-
-    private func applyCodexRateLimit(
-        usedPercent: Double,
-        resetAt: Date?,
-        rateLimit: [String: Any],
-        fallback: CodexLimitSlot,
-        to snapshot: inout UsageSnapshot
-    ) {
-        let windowMinutes = codexWindowMinutes(from: rateLimit)
-        let slot: CodexLimitSlot
-
-        if windowMinutes > 0, windowMinutes <= 6 * 60 {
-            slot = .fiveHour
-        } else if windowMinutes >= 24 * 60 {
-            slot = .weekly
-        } else {
-            slot = fallback
-        }
-
-        switch slot {
-        case .fiveHour:
-            snapshot.codexPrimaryLimit = clampedPercent(usedPercent)
-            snapshot.codexPrimaryResetAt = resetAt
-        case .weekly:
-            snapshot.codexSecondaryLimit = clampedPercent(usedPercent)
-            snapshot.codexSecondaryResetAt = resetAt
-        }
     }
 }
 
@@ -2186,69 +2037,13 @@ final class NotchNotifierModel: ObservableObject {
     }
 }
 
-enum UsagePanelPage: String, CaseIterable, Identifiable {
-    case overview
-    case codex
-    case claude
-    case openCode
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .overview: "Overview"
-        case .openCode: "OpenCode"
-        case .codex: "Codex"
-        case .claude: "Claude"
-        }
-    }
-}
-
-struct ProviderUsageSummary: Identifiable {
-    let page: UsagePanelPage
-    let name: String
-    let color: Color
-    let activity: HourlyUsageActivity
-    let remainingPercent: Double?
-
-    var id: UsagePanelPage { page }
-}
-
-struct UsageDetailItem: Identifiable {
-    let label: String
-    let value: String
-
-    var id: String { label }
-}
-
-enum UsageFormatting {
-    static func tokens(_ value: Double) -> String {
-        value.formatted(.number.notation(.compactName).precision(.fractionLength(0)))
-    }
-
-    static func cost(_ value: Double?) -> String {
-        guard let value else { return "n/a" }
-        if value > 0, value < 0.01 { return "<$0.01" }
-        return value.formatted(.currency(code: "USD").precision(.fractionLength(2)))
-    }
-
-    static func integer(_ value: Int) -> String {
-        value.formatted(.number.notation(.compactName).precision(.fractionLength(0)))
-    }
-}
-
 struct UsagePanelView: View {
     @StateObject private var model = UsagePanelModel()
-    @State private var selectedPage = UsagePanelPage.overview
-
-    private let openCodeColor = Color(red: 0.20, green: 0.72, blue: 0.88)
-    private let codexColor = Color(red: 0.43, green: 0.52, blue: 0.98)
-    private let claudeColor = Color(red: 0.96, green: 0.57, blue: 0.23)
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Label("AI Usage", systemImage: "chart.pie.fill")
+                Label("AI Usage", systemImage: "bolt.horizontal.circle.fill")
                     .font(.subheadline.weight(.semibold))
 
                 Spacer()
@@ -2265,167 +2060,94 @@ struct UsagePanelView: View {
                     Image(systemName: "arrow.clockwise")
                 }
                 .buttonStyle(.borderless)
-                .help("Refresh usage")
                 .disabled(model.isLoading)
             }
 
-            Picker("Usage view", selection: $selectedPage) {
-                ForEach(UsagePanelPage.allCases) { page in
-                    Text(page.title).tag(page)
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.segmented)
+            UsageSectionView(
+                title: "OpenCode",
+                activity: model.snapshot.openCodeHourlyActivity,
+                activityColor: Color(red: 0.30, green: 0.78, blue: 0.96),
+                rows: [
+                    remainingRow(
+                        "5h left",
+                        remainingPercent: openCodeFiveHourLeft,
+                        resetAt: nil
+                    ),
+                    remainingRow(
+                        "Weekly left",
+                        remainingPercent: openCodeWeeklyLeft,
+                        resetAt: nil
+                    ),
+                    remainingRow(
+                        "Monthly left",
+                        remainingPercent: openCodeMonthlyLeft,
+                        resetAt: nil
+                    )
+                ]
+            )
 
-            Group {
-                switch selectedPage {
-                case .overview:
-                    UsageOverviewView(providers: providerSummaries)
-                case .openCode:
-                    OpenCodeUsageDetailView(
-                        color: openCodeColor,
-                        weeklyUsage: model.snapshot.openCodeWeekly,
-                        rows: openCodeRows,
-                        details: openCodeDetails
+            UsageSectionView(
+                title: "Codex",
+                activity: model.snapshot.codexHourlyActivity,
+                activityColor: Color(red: 0.45, green: 0.55, blue: 1.00),
+                rows: [
+                    remainingRow(
+                        "5h left",
+                        remainingPercent: codexPrimaryLeft,
+                        resetAt: model.snapshot.codexPrimaryResetAt
+                    ),
+                    remainingRow(
+                        "Weekly left",
+                        remainingPercent: codexSecondaryLeft,
+                        resetAt: model.snapshot.codexSecondaryResetAt
                     )
-                case .codex:
-                    ProviderUsageDetailView(
-                        provider: codexSummary,
-                        costLabel: "24h estimate",
-                        rows: codexRows,
-                        details: codexDetails
+                ]
+            )
+
+            UsageSectionView(
+                title: "Claude Code",
+                activity: model.snapshot.claudeHourlyActivity,
+                activityColor: Color(red: 1.00, green: 0.63, blue: 0.28),
+                rows: [
+                    remainingRow(
+                        "5h left",
+                        remainingPercent: claudeFiveHourLeft,
+                        resetAt: model.snapshot.claudeFiveHourResetAt
+                    ),
+                    remainingRow(
+                        "7d left",
+                        remainingPercent: claudeSevenDayLeft,
+                        resetAt: model.snapshot.claudeSevenDayResetAt
                     )
-                case .claude:
-                    ProviderUsageDetailView(
-                        provider: claudeSummary,
-                        costLabel: "24h estimate",
-                        rows: claudeRows,
-                        details: claudeDetails
-                    )
-                }
-            }
-            .frame(height: 390, alignment: .top)
+                ]
+            )
+
         }
-        .padding(12)
-        .frame(width: 380)
+        .padding(10)
+        .frame(width: 300)
         .onAppear {
             model.refresh()
         }
-    }
-
-    private var providerSummaries: [ProviderUsageSummary] {
-        [codexSummary, claudeSummary, openCodeSummary]
-    }
-
-    private var codexSummary: ProviderUsageSummary {
-        ProviderUsageSummary(
-            page: .codex,
-            name: "Codex",
-            color: codexColor,
-            activity: model.snapshot.codexHourlyActivity,
-            remainingPercent: overviewRemaining([codexSecondaryLeft])
-        )
-    }
-
-    private var claudeSummary: ProviderUsageSummary {
-        ProviderUsageSummary(
-            page: .claude,
-            name: "Claude Code",
-            color: claudeColor,
-            activity: model.snapshot.claudeHourlyActivity,
-            remainingPercent: overviewRemaining([claudeSevenDayLeft])
-        )
-    }
-
-    private var openCodeSummary: ProviderUsageSummary {
-        ProviderUsageSummary(
-            page: .openCode,
-            name: "OpenCode",
-            color: openCodeColor,
-            activity: model.snapshot.openCodeHourlyActivity,
-            remainingPercent: openCodeWeeklyLeft
-        )
-    }
-
-    private var openCodeRows: [UsageDisplayRow] {
-        [
-            UsageDisplayRow(label: "5h left", value: "n/a", progress: 0, color: .secondary),
-            estimatedOpenCodeWeeklyRow,
-            UsageDisplayRow(label: "Monthly left", value: "n/a", progress: 0, color: .secondary)
-        ]
-    }
-
-    private var codexRows: [UsageDisplayRow] {
-        [
-            remainingRow(
-                "5h left",
-                remainingPercent: codexPrimaryLeft,
-                resetAt: model.snapshot.codexPrimaryResetAt,
-                showLoadingFallback: false
-            ),
-            remainingRow("Weekly left", remainingPercent: codexSecondaryLeft, resetAt: model.snapshot.codexSecondaryResetAt)
-        ]
-    }
-
-    private var claudeRows: [UsageDisplayRow] {
-        [
-            remainingRow("5h left", remainingPercent: claudeFiveHourLeft, resetAt: model.snapshot.claudeFiveHourResetAt),
-            remainingRow("7d left", remainingPercent: claudeSevenDayLeft, resetAt: model.snapshot.claudeSevenDayResetAt)
-        ]
-    }
-
-    private var openCodeDetails: [UsageDetailItem] {
-        [
-            UsageDetailItem(label: "Recorded total", value: UsageFormatting.cost(model.snapshot.openCodeCost)),
-            UsageDetailItem(label: "Messages", value: UsageFormatting.integer(model.snapshot.openCodeMessages)),
-            UsageDetailItem(label: "Total tokens", value: UsageFormatting.integer(model.snapshot.openCodeTokens.total)),
-            UsageDetailItem(label: "Current model", value: cleanModel(model.snapshot.openCodeModel))
-        ]
-    }
-
-    private var codexDetails: [UsageDetailItem] {
-        [
-            UsageDetailItem(label: "Latest tokens", value: UsageFormatting.integer(model.snapshot.codexTokens.total)),
-            UsageDetailItem(label: "Input / output", value: "\(UsageFormatting.integer(model.snapshot.codexTokens.input)) / \(UsageFormatting.integer(model.snapshot.codexTokens.output))"),
-            UsageDetailItem(label: "Cached / reasoning", value: "\(UsageFormatting.integer(model.snapshot.codexTokens.cached)) / \(UsageFormatting.integer(model.snapshot.codexTokens.reasoning))"),
-            UsageDetailItem(label: "Reasoning mode", value: model.snapshot.codexHourlyActivity.dominantReasoningMode ?? "n/a"),
-            UsageDetailItem(label: "Current model", value: cleanModel(model.snapshot.codexModel))
-        ]
-    }
-
-    private var claudeDetails: [UsageDetailItem] {
-        [
-            UsageDetailItem(label: "Most used model", value: model.snapshot.claudeHourlyActivity.dominantModel ?? "n/a"),
-            UsageDetailItem(label: "Reasoning mode", value: model.snapshot.claudeHourlyActivity.dominantReasoningMode ?? "n/a"),
-            UsageDetailItem(label: "Updated", value: model.snapshot.claudeUpdatedAt?.formatted(date: .omitted, time: .shortened) ?? "n/a")
-        ]
     }
 
     private var codexPrimaryLeft: Double? {
         model.snapshot.codexPrimaryLimit.map { 100 - $0 }
     }
 
+    private var openCodeFiveHourLeft: Double {
+        openCodeRemainingPercent(model.snapshot.openCodeFiveHour, limit: 12)
+    }
+
+    private var openCodeWeeklyLeft: Double {
+        openCodeRemainingPercent(model.snapshot.openCodeWeekly, limit: 30)
+    }
+
+    private var openCodeMonthlyLeft: Double {
+        openCodeRemainingPercent(model.snapshot.openCodeMonthly, limit: 60)
+    }
+
     private var codexSecondaryLeft: Double? {
         model.snapshot.codexSecondaryLimit.map { 100 - $0 }
-    }
-
-    private var openCodeWeeklyLeft: Double? {
-        let usage = model.snapshot.openCodeWeekly
-        guard usage.messages > 0 || usage.cost > 0 else { return nil }
-        return max(0, 100 - (usage.cost / 30) * 100)
-    }
-
-    private var estimatedOpenCodeWeeklyRow: UsageDisplayRow {
-        guard let remaining = openCodeWeeklyLeft else {
-            return UsageDisplayRow(label: "Weekly left · local est.", value: "n/a", progress: 0, color: .secondary)
-        }
-
-        return UsageDisplayRow(
-            label: "Weekly left · local est.",
-            value: "~\(formatPercent(remaining))%",
-            progress: remaining / 100,
-            color: remainingColor(for: remaining)
-        )
     }
 
     private var claudeFiveHourLeft: Double? {
@@ -2436,24 +2158,18 @@ struct UsagePanelView: View {
         model.snapshot.claudeSevenDayLimit.map { 100 - $0 }
     }
 
-    private func overviewRemaining(_ values: [Double?]) -> Double? {
-        let available = values.compactMap { $0 }
-        if let lowest = available.min() { return lowest }
-        return model.isLoading ? 100 : nil
+    private func usageRow(_ label: String, usedPercent: Double) -> UsageDisplayRow {
+        UsageDisplayRow(
+            label: label,
+            value: "\(formatPercent(usedPercent))%",
+            progress: usedPercent / 100,
+            color: usageColor(for: usedPercent)
+        )
     }
 
-    private func cleanModel(_ value: String) -> String {
-        value == "Not found" || value == "Unknown" ? "n/a" : value
-    }
-
-    private func remainingRow(
-        _ label: String,
-        remainingPercent: Double?,
-        resetAt: Date?,
-        showLoadingFallback: Bool = true
-    ) -> UsageDisplayRow {
+    private func remainingRow(_ label: String, remainingPercent: Double?, resetAt: Date?) -> UsageDisplayRow {
         guard let remainingPercent else {
-            if model.isLoading, showLoadingFallback {
+            if model.isLoading {
                 return UsageDisplayRow(
                     label: label,
                     value: "100%",
@@ -2471,6 +2187,20 @@ struct UsagePanelView: View {
             progress: remainingPercent / 100,
             color: remainingColor(for: remainingPercent)
         )
+    }
+
+    private func openCodePercent(_ window: OpenCodeUsageWindow, limit: Double) -> Double {
+        limit > 0 ? (window.cost / limit) * 100 : 0
+    }
+
+    private func openCodeRemainingPercent(_ window: OpenCodeUsageWindow, limit: Double) -> Double {
+        max(0, 100 - openCodePercent(window, limit: limit))
+    }
+
+    private func usageColor(for percent: Double) -> Color {
+        if percent >= 85 { return barCritical }
+        if percent >= 60 { return barWarning }
+        return barHealthy
     }
 
     private func remainingColor(for percent: Double) -> Color {
@@ -2532,277 +2262,46 @@ struct UsageDisplayRow {
     let color: Color
 }
 
-struct UsageOverviewView: View {
-    let providers: [ProviderUsageSummary]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .center, spacing: 16) {
-                UsageCostDonutChart(providers: providers)
-                    .frame(width: 126, height: 126)
-
-                VStack(spacing: 9) {
-                    ForEach(providers) { provider in
-                        HStack(spacing: 7) {
-                            Circle()
-                                .fill(provider.color)
-                                .frame(width: 7, height: 7)
-
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(provider.name)
-                                    .font(.caption.weight(.semibold))
-
-                                Text("\(UsageFormatting.tokens(provider.activity.total)) tok")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            Spacer(minLength: 6)
-
-                            Text(UsageFormatting.cost(provider.activity.estimatedCost))
-                                .font(.caption.monospacedDigit().weight(.semibold))
-                        }
-                    }
-                }
-            }
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Weekly left")
-                    .font(.caption.weight(.semibold))
-
-                ForEach(providers) { provider in
-                    OverviewProviderLimitRow(provider: provider)
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-    }
-}
-
-struct UsageCostDonutChart: View {
-    let providers: [ProviderUsageSummary]
-
-    @State private var isHovered = false
-
-    private var total: Double {
-        providers.compactMap { $0.activity.estimatedCost }.reduce(0, +)
-    }
-
-    var body: some View {
-        ZStack {
-            if total > 0 {
-                Chart(providers) { provider in
-                    SectorMark(
-                        angle: .value("Cost", max(0, provider.activity.estimatedCost ?? 0)),
-                        innerRadius: .ratio(0.72),
-                        angularInset: 1.5
-                    )
-                    .cornerRadius(3)
-                    .foregroundStyle(provider.color)
-                }
-                .chartLegend(.hidden)
-                .animation(.smooth(duration: 0.55), value: total)
-            } else {
-                Circle()
-                    .stroke(Color.secondary.opacity(0.18), lineWidth: 16)
-                    .padding(8)
-            }
-
-            VStack(spacing: 1) {
-                Text(UsageFormatting.cost(total))
-                    .font(.subheadline.monospacedDigit().weight(.semibold))
-                Text("24h API value")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Estimated API value during the last 24 hours")
-        .accessibilityValue(UsageFormatting.cost(total))
-        .contentShape(Circle())
-        .scaleEffect(isHovered ? 1.055 : 1)
-        .animation(.snappy(duration: 0.16), value: isHovered)
-        .onHover { isHovered = $0 }
-    }
-}
-
-struct OverviewProviderLimitRow: View {
-    let provider: ProviderUsageSummary
-
-    var body: some View {
-        VStack(spacing: 3) {
-            HStack {
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(provider.color)
-                        .frame(width: 6, height: 6)
-                    Text(provider.page == .openCode ? "OpenCode · local est." : provider.name)
-                }
-
-                Spacer()
-
-                Text(remainingText)
-                    .fontWeight(.semibold)
-            }
-            .font(.caption)
-
-            AnimatedUsageBar(
-                progress: (provider.remainingPercent ?? 0) / 100,
-                color: remainingColor
-            )
-        }
-    }
-
-    private var remainingText: String {
-        guard let value = provider.remainingPercent else { return "n/a" }
-        let prefix = provider.page == .openCode ? "~" : ""
-        return "\(prefix)\(value.formatted(.number.precision(.fractionLength(0))))% left"
-    }
-
-    private var remainingColor: Color {
-        guard let value = provider.remainingPercent else { return .secondary }
-        if value <= 15 { return Color(red: 0.98, green: 0.32, blue: 0.28) }
-        if value <= 40 { return Color(red: 1.00, green: 0.68, blue: 0.25) }
-        return Color(red: 0.22, green: 0.84, blue: 0.55)
-    }
-}
-
-struct OpenCodeUsageDetailView: View {
-    let color: Color
-    let weeklyUsage: OpenCodeUsageWindow
+struct UsageSectionView: View {
+    let title: String
+    let activity: HourlyUsageActivity
+    let activityColor: Color
+    var subtitle: String? = nil
     let rows: [UsageDisplayRow]
-    let details: [UsageDetailItem]
+
+    @State private var hoveredActivityText: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                UsageMetricTile(
-                    label: "7d local tokens",
-                    value: UsageFormatting.integer(weeklyUsage.tokens.total),
-                    color: color
-                )
-                UsageMetricTile(
-                    label: "7d recorded",
-                    value: UsageFormatting.cost(weeklyUsage.cost),
-                    color: color
-                )
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Local usage")
+        VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
                     .font(.caption.weight(.semibold))
 
-                ForEach(details) { detail in
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(detail.label)
-                            .foregroundStyle(.secondary)
-                        Spacer(minLength: 12)
-                        Text(detail.value)
-                            .fontWeight(.semibold)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.75)
-                            .textSelection(.enabled)
-                    }
-                }
-            }
-            .font(.caption)
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Subscription limits")
-                    .font(.caption.weight(.semibold))
-
-                ForEach(rows, id: \.label) { row in
-                    VStack(spacing: 2) {
-                        HStack {
-                            Text(row.label)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Text(row.value)
-                                .fontWeight(.semibold)
-                        }
-
-                        AnimatedUsageBar(progress: row.progress, color: row.color)
-                    }
-                }
-            }
-            .font(.caption)
-        }
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-    }
-}
-
-struct ProviderUsageDetailView: View {
-    let provider: ProviderUsageSummary
-    let costLabel: String
-    let rows: [UsageDisplayRow]
-    let details: [UsageDetailItem]
-
-    @State private var hoveredIndex: Int?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                UsageMetricTile(
-                    label: "24h tokens",
-                    value: UsageFormatting.tokens(provider.activity.total),
-                    color: provider.color
-                )
-                UsageMetricTile(
-                    label: costLabel,
-                    value: UsageFormatting.cost(provider.activity.estimatedCost),
-                    color: provider.color
-                )
-            }
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text(hoverText ?? "24h token activity")
-                    .font(.caption.weight(.semibold))
+                Text(hoveredActivityText ?? subtitle ?? "")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.primary)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.72)
-                    .frame(height: 15, alignment: .leading)
+                    .minimumScaleFactor(0.75)
+                    .opacity(hoveredActivityText == nil && subtitle == nil ? 0 : 1)
+                    .frame(height: 13, alignment: .leading)
+            }
 
-                ProviderUsageLineChart(
-                    activity: provider.activity,
-                    color: provider.color,
-                    hoveredIndex: $hoveredIndex
-                )
-                .frame(height: 104)
+            UsageActivityStrip(activity: activity, color: activityColor) { text in
+                hoveredActivityText = text
             }
 
             VStack(spacing: 5) {
-                ForEach(details) { detail in
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(detail.label)
-                            .foregroundStyle(.secondary)
-                        Spacer(minLength: 12)
-                        Text(detail.value)
-                            .fontWeight(.semibold)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.75)
-                            .textSelection(.enabled)
-                    }
-                }
-            }
-            .font(.caption)
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Subscription limits")
-                    .font(.caption.weight(.semibold))
-
                 ForEach(rows, id: \.label) { row in
                     VStack(spacing: 2) {
                         HStack {
                             Text(row.label)
                                 .foregroundStyle(.secondary)
+
                             Spacer()
+
                             Text(row.value)
                                 .fontWeight(.semibold)
+                                .textSelection(.enabled)
                         }
 
                         AnimatedUsageBar(progress: row.progress, color: row.color)
@@ -2811,139 +2310,97 @@ struct ProviderUsageDetailView: View {
             }
             .font(.caption)
         }
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-    }
-
-    private var hoverText: String? {
-        guard let index = hoveredIndex,
-              provider.activity.values.indices.contains(index) else {
-            return nil
-        }
-
-        let time = Date().addingTimeInterval(-24 * 60 * 60 + Double(index) * 60 * 60)
-        let model = provider.activity.models[index].map { "\($0) · " } ?? ""
-        let reasoning = provider.activity.reasoningModes[index].map { " · \($0)" } ?? ""
-        let tokens = UsageFormatting.tokens(provider.activity.values[index])
-        let cost = provider.activity.costs[index].map { " · \(UsageFormatting.cost($0))" } ?? ""
-        return "\(model)\(time.formatted(date: .omitted, time: .shortened)) · \(tokens) tok\(reasoning)\(cost)"
-    }
-}
-
-struct UsageMetricTile: View {
-    let label: String
-    let value: String
-    let color: Color
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(label)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.title3.monospacedDigit().weight(.semibold))
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
-        }
         .padding(8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(color.opacity(0.10))
-        .overlay {
-            RoundedRectangle(cornerRadius: 6)
-                .stroke(color.opacity(0.20), lineWidth: 1)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .background(.regularMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 7))
     }
 }
 
-struct ProviderUsageLineChart: View {
+struct UsageActivityStrip: View {
     let activity: HourlyUsageActivity
     let color: Color
-    @Binding var hoveredIndex: Int?
+    let onHoverTextChanged: (String?) -> Void
+
+    @State private var displayedValues = Array(repeating: 0.0, count: 24)
+    @State private var hoveredIndex: Int?
+
+    private var maximum: Double {
+        max(activity.maximum, 1)
+    }
+
+    private var targetValues: [Double] {
+        guard activity.total > 0 else {
+            return Array(repeating: 0, count: 24)
+        }
+
+        return activity.values.map { min(1, max(0, $0 / maximum)) }
+    }
 
     var body: some View {
-        Chart {
-            ForEach(Array(activity.values.enumerated()), id: \.offset) { index, value in
-                AreaMark(
-                    x: .value("Hour", index),
-                    y: .value("Tokens", value)
-                )
-                .foregroundStyle(
-                    LinearGradient(
-                        colors: [color.opacity(0.28), color.opacity(0.02)],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                )
-                .interpolationMethod(.monotone)
-
-                LineMark(
-                    x: .value("Hour", index),
-                    y: .value("Tokens", value)
-                )
-                .foregroundStyle(color)
-                .lineStyle(StrokeStyle(lineWidth: 2.2, lineCap: .round, lineJoin: .round))
-                .interpolationMethod(.monotone)
-            }
-
-            if let hoveredIndex,
-               activity.values.indices.contains(hoveredIndex) {
-                RuleMark(x: .value("Selected hour", hoveredIndex))
-                    .foregroundStyle(Color.secondary.opacity(0.35))
-                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
-
-                PointMark(
-                    x: .value("Selected hour", hoveredIndex),
-                    y: .value("Selected tokens", activity.values[hoveredIndex])
-                )
-                .foregroundStyle(color)
-                .symbolSize(34)
-            }
-        }
-        .chartLegend(.hidden)
-        .animation(.smooth(duration: 0.55), value: activity.values)
-        .chartXAxis {
-            AxisMarks(values: [0, 6, 12, 18, 23]) { value in
-                AxisGridLine()
-                    .foregroundStyle(Color.secondary.opacity(0.10))
-                AxisValueLabel {
-                    if let hour = value.as(Int.self) {
-                        Text(hour == 23 ? "now" : "-\(24 - hour)h")
-                    }
-                }
-            }
-        }
-        .chartYAxis {
-            AxisMarks(position: .leading, values: .automatic(desiredCount: 3)) { value in
-                AxisGridLine()
-                    .foregroundStyle(Color.secondary.opacity(0.10))
-                AxisValueLabel {
-                    if let amount = value.as(Double.self) {
-                        Text(UsageFormatting.tokens(amount))
-                    }
-                }
-            }
-        }
-        .chartOverlay { proxy in
-            GeometryReader { geometry in
-                Rectangle()
-                    .fill(.clear)
-                    .contentShape(Rectangle())
-                    .onContinuousHover { phase in
-                        switch phase {
-                        case .active(let location):
-                            guard let plotFrame = proxy.plotFrame else { return }
-                            let frame = geometry[plotFrame]
-                            let xPosition = location.x - frame.origin.x
-                            if let value: Double = proxy.value(atX: xPosition) {
-                                hoveredIndex = min(23, max(0, Int(value.rounded())))
+        ZStack(alignment: .bottom) {
+            HStack(alignment: .bottom, spacing: 2) {
+                ForEach(Array(displayedValues.enumerated()), id: \.offset) { index, value in
+                    RoundedRectangle(cornerRadius: 1.5)
+                        .fill(value > 0 ? color.opacity(0.92) : Color.white.opacity(0.10))
+                        .frame(maxWidth: .infinity)
+                        .frame(height: value > 0 ? max(3, 24 * CGFloat(value)) : 3)
+                        .scaleEffect(
+                            x: hoveredIndex == index ? 1.18 : 1,
+                            y: hoveredIndex == index ? 1.10 : 1,
+                            anchor: .bottom
+                        )
+                        .contentShape(Rectangle())
+                        .onHover { isHovering in
+                            withAnimation(.easeOut(duration: 0.10)) {
+                                hoveredIndex = isHovering ? index : (hoveredIndex == index ? nil : hoveredIndex)
+                                onHoverTextChanged(isHovering ? tooltip(for: index, value: activity.values[index]) : nil)
                             }
-                        case .ended:
-                            hoveredIndex = nil
                         }
-                    }
+                        .zIndex(hoveredIndex == index ? 1 : 0)
+                }
             }
         }
-        .accessibilityLabel("Hourly token usage for \(activity.total.formatted()) tokens")
+        .frame(height: 24, alignment: .bottom)
+        .animation(.easeOut(duration: 0.10), value: hoveredIndex)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Hourly usage during the last 24 hours")
+        .accessibilityValue(activity.total > 0 ? "Activity recorded" : "No activity recorded")
+        .onAppear {
+            animate(to: targetValues)
+        }
+        .onChange(of: targetValues) { _, newValue in
+            animate(to: newValue)
+        }
+    }
+
+    private func animate(to values: [Double]) {
+        withAnimation(.smooth(duration: 0.55)) {
+            displayedValues = values
+        }
+    }
+
+    private func tooltip(for index: Int, value: Double) -> String {
+        let now = Date()
+        let start = now.addingTimeInterval(-24 * 60 * 60 + Double(index) * 60 * 60)
+        let formatter = DateFormatter()
+        formatter.locale = Locale.current
+        formatter.dateFormat = "HH:mm"
+
+        let amount = value.formatted(.number.notation(.compactName).precision(.fractionLength(0)))
+        let unit: String
+        switch activity.metric {
+        case .tokens:
+            unit = "tokens"
+        case .requests:
+            unit = value == 1 ? "request" : "requests"
+        }
+
+        let modelText = activity.models[index].map { "\($0) · " } ?? ""
+        let costText = activity.costs[index].map {
+            " · est. " + $0.formatted(.currency(code: "USD").precision(.fractionLength(2)))
+        } ?? ""
+        return "\(modelText)\(formatter.string(from: start)) · \(amount) \(unit)\(costText)"
     }
 }
 
