@@ -28,6 +28,18 @@ struct TokenUsage: Sendable {
     }
 }
 
+struct TokenPricing: Sendable {
+    let inputPerMillion: Double
+    let cachedInputPerMillion: Double
+    let outputPerMillion: Double
+
+    nonisolated init(inputPerMillion: Double, cachedInputPerMillion: Double? = nil, outputPerMillion: Double) {
+        self.inputPerMillion = inputPerMillion
+        self.cachedInputPerMillion = cachedInputPerMillion ?? inputPerMillion
+        self.outputPerMillion = outputPerMillion
+    }
+}
+
 struct HourlyUsageActivity: Sendable {
     enum Metric: Sendable {
         case tokens
@@ -36,14 +48,23 @@ struct HourlyUsageActivity: Sendable {
 
     let values: [Double]
     let metric: Metric
+    let models: [String?]
+    let costs: [Double?]
 
-    nonisolated init(values: [Double] = Array(repeating: 0, count: 24), metric: Metric = .tokens) {
+    nonisolated init(
+        values: [Double] = Array(repeating: 0, count: 24),
+        metric: Metric = .tokens,
+        models: [String?] = Array(repeating: nil, count: 24),
+        costs: [Double?] = Array(repeating: nil, count: 24)
+    ) {
         if values.count == 24 {
             self.values = values
         } else {
             self.values = Array(values.prefix(24)) + Array(repeating: 0, count: max(0, 24 - values.count))
         }
         self.metric = metric
+        self.models = Array(models.prefix(24)) + Array(repeating: nil, count: max(0, 24 - models.count))
+        self.costs = Array(costs.prefix(24)) + Array(repeating: nil, count: max(0, 24 - costs.count))
     }
 
     var total: Double {
@@ -263,8 +284,9 @@ actor UsageReader {
     private func readOpenCodeUsage(into snapshot: inout UsageSnapshot) {
         let databaseURL = home.appendingPathComponent(".local/share/opencode/opencode.db")
         if FileManager.default.fileExists(atPath: databaseURL.path) {
-            _ = readOpenCodeUsageFromDatabase(into: &snapshot)
-            return
+            if readOpenCodeUsageFromDatabase(into: &snapshot) {
+                return
+            }
         }
 
         let messageURL = home.appendingPathComponent(".local/share/opencode/storage/message")
@@ -337,22 +359,26 @@ actor UsageReader {
         if FileManager.default.fileExists(atPath: databaseURL.path) {
             let sql = """
             with assistant as (
-              select time_updated/1000.0 as ts,
+              select a.time_updated/1000.0 as ts,
                      coalesce(cast(json_extract(a.data,'$.tokens.input') as integer),0)
                        + coalesce(cast(json_extract(a.data,'$.tokens.output') as integer),0)
                        + coalesce(cast(json_extract(a.data,'$.tokens.reasoning') as integer),0) as tokens,
-                     json_extract(u.data,'$.model.providerID') as provider
+                     coalesce(json_extract(a.data,'$.providerID'), json_extract(u.data,'$.model.providerID')) as provider,
+                     coalesce(json_extract(a.data,'$.modelID'), json_extract(u.data,'$.model.modelID'), 'Unknown') as model,
+                     coalesce(cast(json_extract(a.data,'$.cost') as real),0) as cost
               from message a
               left join message u on u.id = json_extract(a.data,'$.parentID')
               where json_extract(a.data,'$.role')='assistant'
             )
             select cast((ts - (strftime('%s','now') - 86400))/3600 as integer),
-                   coalesce(sum(case when tokens > 0 then tokens else 1 end),0)
+                   model,
+                   coalesce(sum(case when tokens > 0 then tokens else 1 end),0),
+                   coalesce(sum(cost),0)
             from assistant
             where provider='opencode-go'
               and ts >= strftime('%s','now') - 86400
-            group by 1
-            order by 1;
+            group by 1, 2
+            order by 1, 2;
             """
 
             return hourlyActivity(from: runSQLiteQuery(databaseURL: databaseURL, sql: sql, timeout: 0.8))
@@ -391,6 +417,9 @@ actor UsageReader {
 
     private func hourlyActivity(from output: String?) -> HourlyUsageActivity {
         var values = Array(repeating: 0.0, count: 24)
+        var models = Array<String?>(repeating: nil, count: 24)
+        var costs = Array<Double?>(repeating: nil, count: 24)
+        var modelTokenTotals = Array(repeating: 0.0, count: 24)
         guard let output, !output.isEmpty else { return HourlyUsageActivity(values: values, metric: .tokens) }
 
         for line in output.split(whereSeparator: \.isNewline) {
@@ -398,14 +427,25 @@ actor UsageReader {
             guard columns.count >= 2,
                   let index = Int(columns[0]),
                   values.indices.contains(index),
-                  let amount = Double(columns[1]) else {
+                  let amount = Double(columns.count >= 4 ? columns[2] : columns[1]) else {
                 continue
             }
 
-            values[index] += max(1, amount)
+            let normalizedAmount = max(1, amount)
+            values[index] += normalizedAmount
+
+            if columns.count >= 4 {
+                let model = String(columns[1])
+                costs[index] = (costs[index] ?? 0) + (Double(columns[3]) ?? 0)
+
+                if normalizedAmount > modelTokenTotals[index] {
+                    modelTokenTotals[index] = normalizedAmount
+                    models[index] = model
+                }
+            }
         }
 
-        return HourlyUsageActivity(values: values, metric: .tokens)
+        return HourlyUsageActivity(values: values, metric: .tokens, models: models, costs: costs)
     }
 
     private func hourlyActivityIndex(for date: Date, now: Date) -> Int? {
@@ -416,10 +456,14 @@ actor UsageReader {
 
     private func readCodexHourlyActivity() -> HourlyUsageActivity {
         var values = Array(repeating: 0.0, count: 24)
+        var models = Array<String?>(repeating: nil, count: 24)
+        var costs = Array<Double?>(repeating: nil, count: 24)
+        var modelTokenTotals = Array(repeating: 0.0, count: 24)
         let now = Date()
 
         for file in codexSessionFiles(limit: 24) {
             guard let contents = tailString(from: file.url, maxBytes: 500_000) else { continue }
+            let fallbackModel = latestModel(in: contents) ?? "Codex"
 
             for line in contents.split(whereSeparator: \.isNewline) {
                 guard line.contains("\"token_count\""),
@@ -436,15 +480,32 @@ actor UsageReader {
                 }
 
                 let tokens = intValue(lastUsage["total_tokens"])
-                values[index] += Double(max(1, tokens))
+                let normalizedTokens = Double(max(1, tokens))
+                values[index] += normalizedTokens
+
+                let model = (payload["model"] as? String) ?? fallbackModel
+                let input = intValue(lastUsage["input_tokens"])
+                let output = intValue(lastUsage["output_tokens"])
+                let cached = intValue(lastUsage["cached_input_tokens"])
+                if let cost = estimatedTokenCost(model: model, input: input, output: output, cached: cached) {
+                    costs[index] = (costs[index] ?? 0) + cost
+                }
+
+                if normalizedTokens > modelTokenTotals[index] {
+                    modelTokenTotals[index] = normalizedTokens
+                    models[index] = model
+                }
             }
         }
 
-        return HourlyUsageActivity(values: values, metric: .tokens)
+        return HourlyUsageActivity(values: values, metric: .tokens, models: models, costs: costs)
     }
 
     private func readClaudeHourlyActivity() -> HourlyUsageActivity {
         var values = Array(repeating: 0.0, count: 24)
+        var models = Array<String?>(repeating: nil, count: 24)
+        var costs = Array<Double?>(repeating: nil, count: 24)
+        var modelTokenTotals = Array(repeating: 0.0, count: 24)
         let now = Date()
         let projectsURL = home.appendingPathComponent(".claude/projects", isDirectory: true)
         let files = jsonlFiles(in: projectsURL)
@@ -460,19 +521,37 @@ actor UsageReader {
                       let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       object["type"] as? String == "assistant",
                       let eventDate = dateValue(object["timestamp"]),
-                      let index = hourlyActivityIndex(for: eventDate, now: now),
-                      let message = object["message"] as? [String: Any],
-                      let usage = (object["usage"] as? [String: Any]) ?? (message["usage"] as? [String: Any]) else {
+                      let index = hourlyActivityIndex(for: eventDate, now: now) else {
+                    continue
+                }
+
+                let message = object["message"] as? [String: Any] ?? [:]
+                guard let usage = (object["usage"] as? [String: Any]) ?? (message["usage"] as? [String: Any]) else {
                     continue
                 }
 
                 let tokens = claudeTokenCount(from: usage)
                 guard tokens > 0 else { continue }
-                values[index] += Double(tokens)
+                let normalizedTokens = Double(tokens)
+                values[index] += normalizedTokens
+
+                let model = (object["model"] as? String) ?? (message["model"] as? String) ?? "Claude"
+                let input = intValue(usage["input_tokens"])
+                let output = intValue(usage["output_tokens"])
+                let cached = intValue(usage["cache_creation_input_tokens"])
+                    + intValue(usage["cache_read_input_tokens"])
+                if let cost = estimatedTokenCost(model: model, input: input, output: output, cached: cached) {
+                    costs[index] = (costs[index] ?? 0) + cost
+                }
+
+                if normalizedTokens > modelTokenTotals[index] {
+                    modelTokenTotals[index] = normalizedTokens
+                    models[index] = model
+                }
             }
         }
 
-        return HourlyUsageActivity(values: values, metric: .tokens)
+        return HourlyUsageActivity(values: values, metric: .tokens, models: models, costs: costs)
     }
 
     private func claudeTokenCount(from usage: [String: Any]) -> Int {
@@ -480,6 +559,44 @@ actor UsageReader {
             + intValue(usage["output_tokens"])
             + intValue(usage["cache_creation_input_tokens"])
             + intValue(usage["cache_read_input_tokens"])
+    }
+
+    private func estimatedTokenCost(model: String, input: Int, output: Int, cached: Int) -> Double? {
+        guard let pricing = tokenPricing(for: model) else { return nil }
+
+        let cachedInput = min(max(0, cached), max(0, input))
+        let regularInput = max(0, input - cachedInput)
+        return Double(regularInput) / 1_000_000 * pricing.inputPerMillion
+            + Double(cachedInput) / 1_000_000 * pricing.cachedInputPerMillion
+            + Double(max(0, output)) / 1_000_000 * pricing.outputPerMillion
+    }
+
+    private func tokenPricing(for model: String) -> TokenPricing? {
+        let normalized = model.lowercased()
+
+        if normalized.contains("gpt-5.6-luna") {
+            return TokenPricing(inputPerMillion: 1, outputPerMillion: 6)
+        }
+        if normalized.contains("gpt-5.6-terra") {
+            return TokenPricing(inputPerMillion: 2.5, outputPerMillion: 15)
+        }
+        if normalized.contains("gpt-5.6-sol") {
+            return TokenPricing(inputPerMillion: 5, outputPerMillion: 30)
+        }
+        if normalized == "gpt-5" || normalized.hasPrefix("gpt-5") {
+            return TokenPricing(inputPerMillion: 1.25, cachedInputPerMillion: 0.125, outputPerMillion: 10)
+        }
+        if normalized.contains("claude-fable-5") {
+            return TokenPricing(inputPerMillion: 10, outputPerMillion: 50)
+        }
+        if normalized.contains("claude-opus-4.8") || normalized.contains("claude-opus-4-8") {
+            return TokenPricing(inputPerMillion: 5, outputPerMillion: 25)
+        }
+        if normalized.contains("claude-sonnet-5") {
+            return TokenPricing(inputPerMillion: 2, outputPerMillion: 10)
+        }
+
+        return nil
     }
 
     private func readOpenCodeUsageFromDatabase(into snapshot: inout UsageSnapshot) -> Bool {
@@ -516,7 +633,7 @@ actor UsageReader {
                  coalesce(cast(json_extract(a.data,'$.tokens.reasoning') as integer),0) as reasoning,
                  coalesce(cast(json_extract(a.data,'$.tokens.cache.read') as integer),0)
                    + coalesce(cast(json_extract(a.data,'$.tokens.cache.write') as integer),0) as cached,
-                 json_extract(u.data,'$.model.providerID') as provider
+                 coalesce(json_extract(a.data,'$.providerID'), json_extract(u.data,'$.model.providerID')) as provider
           from message a
           left join message u on u.id = json_extract(a.data,'$.parentID')
           where json_extract(a.data,'$.role')='assistant'
@@ -2279,7 +2396,11 @@ struct UsageActivityStrip: View {
             unit = value == 1 ? "request" : "requests"
         }
 
-        return "\(formatter.string(from: start)) · \(amount) \(unit)"
+        let modelText = activity.models[index].map { "\($0) · " } ?? ""
+        let costText = activity.costs[index].map {
+            " · est. " + $0.formatted(.currency(code: "USD").precision(.fractionLength(2)))
+        } ?? ""
+        return "\(modelText)\(formatter.string(from: start)) · \(amount) \(unit)\(costText)"
     }
 }
 
