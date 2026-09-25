@@ -12,6 +12,62 @@ enum StatusMode {
     case failed
 }
 
+struct AgentNotice: Identifiable {
+    let id: String
+    let source: String
+    let title: String
+    let detail: String
+    let mode: StatusMode
+}
+
+struct NoticeTimeline {
+    private(set) var notices: [AgentNotice] = []
+
+    @discardableResult
+    mutating func record(source: String, threadID: String?, title: String, detail: String, mode: StatusMode) -> (changed: Bool, shouldChime: Bool) {
+        let anonymousID = "\(source)|running"
+        let id: String
+        if let threadID, !threadID.isEmpty {
+            id = "\(source)|\(threadID)"
+        } else if mode == .running || notices.contains(where: { $0.id == anonymousID && $0.mode == .running }) {
+            id = anonymousID
+        } else {
+            id = UUID().uuidString
+        }
+
+        let previous = notices.first { $0.id == id }
+        if let previous,
+           previous.mode == mode,
+           previous.title == title,
+           previous.detail == detail {
+            return (false, false)
+        }
+        let changedStatus = previous?.mode != mode
+        notices.removeAll { $0.id == id }
+        notices.insert(AgentNotice(id: id, source: source, title: title, detail: detail, mode: mode), at: 0)
+        if notices.count > 20 {
+            if let oldestFinished = notices.lastIndex(where: { $0.mode != .running }) {
+                notices.remove(at: oldestFinished)
+            } else {
+                notices.removeLast()
+            }
+        }
+        return (true, changedStatus)
+    }
+
+    mutating func dismiss(_ id: String) {
+        notices.removeAll { $0.id == id && $0.mode != .running }
+    }
+
+    mutating func dismissFinished() {
+        notices.removeAll { $0.mode != .running }
+    }
+
+    mutating func clear() {
+        notices.removeAll()
+    }
+}
+
 struct TokenUsage: Sendable {
     var input: Int = 0
     var output: Int = 0
@@ -103,10 +159,8 @@ struct UsageSnapshot: Sendable {
     var codexModel: String = "Not found"
     var codexTokens = TokenUsage()
     var codexHourlyActivity = HourlyUsageActivity(metric: .tokens)
-    var codexPrimaryLimit: Double?
-    var codexSecondaryLimit: Double?
-    var codexPrimaryResetAt: Date?
-    var codexSecondaryResetAt: Date?
+    var codexWeeklyLimit: Double?
+    var codexWeeklyResetAt: Date?
     var codexUpdatedAt: Date?
     var claudeFiveHourLimit: Double?
     var claudeSevenDayLimit: Double?
@@ -129,10 +183,8 @@ struct UsageSnapshot: Sendable {
         codexModel: String = "Not found",
         codexTokens: TokenUsage = TokenUsage(),
         codexHourlyActivity: HourlyUsageActivity = HourlyUsageActivity(metric: .tokens),
-        codexPrimaryLimit: Double? = nil,
-        codexSecondaryLimit: Double? = nil,
-        codexPrimaryResetAt: Date? = nil,
-        codexSecondaryResetAt: Date? = nil,
+        codexWeeklyLimit: Double? = nil,
+        codexWeeklyResetAt: Date? = nil,
         codexUpdatedAt: Date? = nil,
         claudeFiveHourLimit: Double? = nil,
         claudeSevenDayLimit: Double? = nil,
@@ -154,10 +206,8 @@ struct UsageSnapshot: Sendable {
         self.codexModel = codexModel
         self.codexTokens = codexTokens
         self.codexHourlyActivity = codexHourlyActivity
-        self.codexPrimaryLimit = codexPrimaryLimit
-        self.codexSecondaryLimit = codexSecondaryLimit
-        self.codexPrimaryResetAt = codexPrimaryResetAt
-        self.codexSecondaryResetAt = codexSecondaryResetAt
+        self.codexWeeklyLimit = codexWeeklyLimit
+        self.codexWeeklyResetAt = codexWeeklyResetAt
         self.codexUpdatedAt = codexUpdatedAt
         self.claudeFiveHourLimit = claudeFiveHourLimit
         self.claudeSevenDayLimit = claudeSevenDayLimit
@@ -255,10 +305,8 @@ actor UsageReader {
 
         snapshot.codexTokens = previousSnapshot.codexTokens
         snapshot.codexUpdatedAt = previousSnapshot.codexUpdatedAt
-        snapshot.codexPrimaryResetAt = previousSnapshot.codexPrimaryResetAt
-        snapshot.codexSecondaryResetAt = previousSnapshot.codexSecondaryResetAt
-        snapshot.codexPrimaryLimit = carriedRateLimit(previousSnapshot.codexPrimaryLimit, resetAt: previousSnapshot.codexPrimaryResetAt)
-        snapshot.codexSecondaryLimit = carriedRateLimit(previousSnapshot.codexSecondaryLimit, resetAt: previousSnapshot.codexSecondaryResetAt)
+        snapshot.codexWeeklyResetAt = previousSnapshot.codexWeeklyResetAt
+        snapshot.codexWeeklyLimit = carriedRateLimit(previousSnapshot.codexWeeklyLimit, resetAt: previousSnapshot.codexWeeklyResetAt)
     }
 
     private func carriedRateLimit(_ usedPercent: Double?, resetAt: Date?) -> Double? {
@@ -807,6 +855,11 @@ actor UsageReader {
         var cachedSnapshot = UsageSnapshot()
         let hasCachedUsage = readClaudeUsageFromCache(into: &cachedSnapshot)
 
+        if cachedSnapshot.claudeFiveHourLimit != nil && cachedSnapshot.claudeSevenDayLimit != nil {
+            mergeMissingClaudeUsage(from: cachedSnapshot, into: &snapshot, hasCachedUsage: true)
+            return
+        }
+
         if readClaudeUsageFromCommand(into: &snapshot) {
             mergeMissingClaudeUsage(from: cachedSnapshot, into: &snapshot, hasCachedUsage: hasCachedUsage)
             return
@@ -1010,29 +1063,30 @@ actor UsageReader {
                 continue
             }
 
-            var foundRateLimit = false
-
-            if let primary = rateLimits["primary"] as? [String: Any],
-               let usedPercent = doubleValue(primary["usedPercent"] ?? primary["used_percent"]) {
-                snapshot.codexPrimaryLimit = clampedPercent(usedPercent)
-                snapshot.codexPrimaryResetAt = appServerResetDate(from: primary)
-                foundRateLimit = true
-            }
-
-            if let secondary = rateLimits["secondary"] as? [String: Any],
-               let usedPercent = doubleValue(secondary["usedPercent"] ?? secondary["used_percent"]) {
-                snapshot.codexSecondaryLimit = clampedPercent(usedPercent)
-                snapshot.codexSecondaryResetAt = appServerResetDate(from: secondary)
-                foundRateLimit = true
-            }
-
-            if foundRateLimit {
+            if let weekly = Self.codexWeeklyWindow(in: rateLimits),
+               let usedPercent = doubleValue(weekly["usedPercent"] ?? weekly["used_percent"]) {
+                snapshot.codexWeeklyLimit = clampedPercent(usedPercent)
+                snapshot.codexWeeklyResetAt = appServerResetDate(from: weekly)
                 snapshot.codexUpdatedAt = Date()
                 return true
             }
         }
 
         return false
+    }
+
+    nonisolated static func codexWeeklyWindow(in rateLimits: [String: Any]) -> [String: Any]? {
+        let windows = ["primary", "secondary"].compactMap { rateLimits[$0] as? [String: Any] }
+        if let weekly = windows.first(where: { window in
+            let duration = window["windowDurationMins"] ?? window["window_minutes"]
+            let minutes = (duration as? NSNumber)?.doubleValue ?? Double(duration as? String ?? "") ?? 0
+            return minutes >= 7 * 24 * 60
+        }) {
+            return weekly
+        }
+
+        // Older session payloads may omit the duration. Their second window was weekly.
+        return rateLimits["secondary"] as? [String: Any]
     }
 
     private func runCodexAppServerRateLimitQuery(timeout: TimeInterval = 5) -> String? {
@@ -1124,9 +1178,6 @@ actor UsageReader {
                     continue
                 }
 
-                latestEventDate = eventDate
-                snapshot.codexUpdatedAt = eventDate
-
                 if let info = payload["info"] as? [String: Any],
                    let usage = info["total_token_usage"] as? [String: Any] {
                     snapshot.codexTokens.input = intValue(usage["input_tokens"])
@@ -1136,21 +1187,14 @@ actor UsageReader {
                     snapshot.codexTokens.total = intValue(usage["total_tokens"])
                 }
 
-                if let primary = rateLimits["primary"] as? [String: Any],
-                   let usedPercent = doubleValue(primary["used_percent"]) {
-                    let resetAt = resetDate(from: primary)
-                    snapshot.codexPrimaryLimit = activeUsedPercent(usedPercent, rateLimit: primary, eventDate: eventDate)
-                    snapshot.codexPrimaryResetAt = resetAt
+                if let weekly = Self.codexWeeklyWindow(in: rateLimits),
+                   let usedPercent = doubleValue(weekly["used_percent"] ?? weekly["usedPercent"]) {
+                    latestEventDate = eventDate
+                    snapshot.codexWeeklyLimit = activeUsedPercent(usedPercent, rateLimit: weekly, eventDate: eventDate)
+                    snapshot.codexWeeklyResetAt = resetDate(from: weekly)
+                    snapshot.codexUpdatedAt = eventDate
+                    break
                 }
-
-                if let secondary = rateLimits["secondary"] as? [String: Any],
-                   let usedPercent = doubleValue(secondary["used_percent"]) {
-                    let resetAt = resetDate(from: secondary)
-                    snapshot.codexSecondaryLimit = activeUsedPercent(usedPercent, rateLimit: secondary, eventDate: eventDate)
-                    snapshot.codexSecondaryResetAt = resetAt
-                }
-
-                break
             }
 
             if snapshot.codexUpdatedAt != nil {
@@ -1312,12 +1356,14 @@ actor UsageReader {
 
 @MainActor
 final class UsagePanelModel: ObservableObject {
+    static let shared = UsagePanelModel()
     @Published var snapshot = UsageSnapshot()
     @Published var isLoading = true
     private static let reader = UsageReader()
     private var refreshTask: Task<Void, Never>?
 
     func refresh(force: Bool = false) {
+        if !force && refreshTask != nil { return }
         refreshTask?.cancel()
         isLoading = true
 
@@ -1327,6 +1373,7 @@ final class UsagePanelModel: ObservableObject {
             guard !Task.isCancelled else { return }
             snapshot = nextSnapshot
             isLoading = false
+            refreshTask = nil
         }
     }
 }
@@ -1346,6 +1393,10 @@ struct NotchMetrics {
 }
 
 extension NSScreen {
+    static var preferredNotchScreen: NSScreen? {
+        screens.first(where: { $0.readNotchMetrics().hasNotch }) ?? main ?? screens.first
+    }
+
     func readNotchMetrics() -> NotchMetrics {
         if #available(macOS 12.0, *) {
             let full = frame
@@ -1385,12 +1436,15 @@ struct IslandLayout {
     let width: CGFloat
     let height: CGFloat
 
-    static func forMode(_ mode: StatusMode, notchWidth: CGFloat) -> IslandLayout {
+    static func forMode(_ mode: StatusMode, notchWidth: CGFloat, screenWidth: CGFloat, itemCount: Int) -> IslandLayout {
         switch mode {
         case .idle:
             return IslandLayout(width: notchWidth, height: 32)
         case .running, .done, .needsInput, .failed:
-            return IslandLayout(width: notchWidth, height: 72)
+            let visibleItems = min(itemCount, 2)
+            let itemWidth = itemCount > 1 ? 128 : 198
+            let contentWidth = CGFloat(visibleItems * itemWidth + max(0, visibleItems - 1) * 8 + 24)
+            return IslandLayout(width: min(screenWidth - 32, max(notchWidth, contentWidth)), height: 72)
         }
     }
 }
@@ -1504,17 +1558,29 @@ final class OpenCodeEventFileMonitor {
     }
 }
 
-final class CodexSessionQuestionMonitor {
+final class CodexSessionEventMonitor {
+    private struct SessionInfo {
+        let id: String
+        let cwd: String
+        let isUserThread: Bool
+
+        var projectName: String {
+            let name = cwd.isEmpty ? "" : URL(fileURLWithPath: cwd).lastPathComponent
+            return name.isEmpty ? "Codex \(id.prefix(8))" : name
+        }
+    }
+
     private let sessionsURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".codex/sessions", isDirectory: true)
     private var timer: Timer?
     private var seenLines = Set<String>()
     private var fileOffsets: [URL: UInt64] = [:]
-    private var onQuestion: (([String: Any]) -> Void)?
+    private var sessionInfo: [URL: SessionInfo] = [:]
+    private var onEvent: (([String: Any]) -> Void)?
     private var didBootstrap = false
 
-    func start(onQuestion: @escaping ([String: Any]) -> Void) {
-        self.onQuestion = onQuestion
+    func start(onEvent: @escaping ([String: Any]) -> Void) {
+        self.onEvent = onEvent
 
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
@@ -1536,26 +1602,71 @@ final class CodexSessionQuestionMonitor {
 
     private func poll() {
         for file in latestSessionFiles().prefix(8) {
+            let info = info(for: file.url)
             guard let contents = appendedString(from: file.url) else { continue }
 
             for rawLine in contents.split(whereSeparator: \.isNewline) {
                 let line = String(rawLine)
-                guard line.contains("request_user_input") else { continue }
-                guard !seenLines.contains(line) else { continue }
-                seenLines.insert(line)
-
-                guard didBootstrap,
-                      let payload = questionPayload(from: line) else {
-                    continue
+                if line.contains("request_user_input") {
+                    guard !seenLines.contains(line) else { continue }
+                    seenLines.insert(line)
+                    if let payload = questionPayload(from: line, info: info) {
+                        logQuestionPayload(payload)
+                        onEvent?(payload)
+                    }
+                } else if let info, info.isUserThread,
+                          line.contains("task_complete"),
+                          let payload = taskPayload(from: line, info: info) {
+                    onEvent?(payload)
                 }
-
-                logQuestionPayload(payload)
-                onQuestion?(payload)
             }
         }
     }
 
-    private func questionPayload(from line: String) -> [String: Any]? {
+    private func info(for url: URL) -> SessionInfo? {
+        if let cached = sessionInfo[url] { return cached }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: 300_000),
+              let firstLine = String(data: data, encoding: .utf8)?.split(whereSeparator: \.isNewline).first,
+              let firstData = String(firstLine).data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: firstData) as? [String: Any],
+              object["type"] as? String == "session_meta",
+              let payload = object["payload"] as? [String: Any],
+              let id = payload["id"] as? String else {
+            return nil
+        }
+
+        let info = SessionInfo(
+            id: id,
+            cwd: payload["cwd"] as? String ?? "",
+            isUserThread: payload["thread_source"] as? String == "user"
+        )
+        sessionInfo[url] = info
+        return info
+    }
+
+    private func taskPayload(from line: String, info: SessionInfo) -> [String: Any]? {
+        guard let data = line.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["type"] as? String == "event_msg",
+              let payload = object["payload"] as? [String: Any],
+              let type = payload["type"] as? String,
+              type == "task_complete" else {
+            return nil
+        }
+
+        return [
+            "event": "done",
+            "source": "codex",
+            "thread-id": info.id,
+            "cwd": info.cwd,
+            "title": "Done: \(info.projectName)",
+            "message": "Codex finished"
+        ]
+    }
+
+    private func questionPayload(from line: String, info: SessionInfo?) -> [String: Any]? {
         guard let data = line.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let payload = object["payload"] as? [String: Any],
@@ -1571,6 +1682,7 @@ final class CodexSessionQuestionMonitor {
         return [
             "event": "question_asked",
             "source": "codex",
+            "thread-id": info?.id ?? "",
             "title": "Approval needed",
             "message": message.isEmpty ? "Codex has a question for you" : message,
             "properties": arguments
@@ -1652,12 +1764,9 @@ final class CodexSessionQuestionMonitor {
 final class NotchNotifierModel: ObservableObject {
     static let shared = NotchNotifierModel()
 
-    @Published var statusText: String = "Done"
-    @Published var detailText: String = ""
+    @Published private(set) var notices: [AgentNotice] = []
     @Published var mode: StatusMode = .idle
-    @Published var isBusy: Bool = false
-    @Published var successPulse: Int = 0
-    @Published var approvalPulse: Int = 0
+    private var timeline = NoticeTimeline()
 
     // Sandbox-aware path. This is the actual path your installed app uses.
     static let supportDirectory: URL = {
@@ -1674,7 +1783,7 @@ final class NotchNotifierModel: ObservableObject {
         NotchNotifierModel.eventFileURL,
         NotchNotifierModel.containerEventFileURL
     ])
-    private let codexQuestionMonitor = CodexSessionQuestionMonitor()
+    private let codexSessionMonitor = CodexSessionEventMonitor()
     private var overlayController: NotchOverlayController?
     private var didStart = false
 
@@ -1693,7 +1802,7 @@ final class NotchNotifierModel: ObservableObject {
             }
         }
 
-        codexQuestionMonitor.start { [weak self] payload in
+        codexSessionMonitor.start { [weak self] payload in
             Task { @MainActor in
                 self?.handle(payload: payload)
             }
@@ -1701,18 +1810,14 @@ final class NotchNotifierModel: ObservableObject {
     }
 
     func dismissOverlayState() {
-        print("dismissOverlayState called, mode =", mode)
+        timeline.dismissFinished()
+        syncOverlay()
+    }
 
-        switch mode {
-        case .done, .needsInput, .failed:
-            overlayController?.hide { [weak self] in
-                self?.mode = .idle
-                self?.isBusy = false
-                print("overlay dismissed")
-            }
-        default:
-            print("dismiss ignored")
-        }
+    func dismissNotice(_ id: String) {
+        let previousCount = timeline.notices.count
+        timeline.dismiss(id)
+        if timeline.notices.count != previousCount { syncOverlay() }
     }
 
     private func ensureOverlay() {
@@ -1745,38 +1850,41 @@ final class NotchNotifierModel: ObservableObject {
             let codexChatName = codexChatDisplayName(from: payload)
             showDone(
                 title: title.isEmpty ? "Done: \(codexChatName)" : title,
-                message: message.isEmpty ? "\(source) finished" : message
+                message: message.isEmpty ? "\(source) finished" : message,
+                payload: payload,
+                source: source
             )
 
         case "done", "completed", "complete", "finished", "finish", "success", "session.idle", "session_idle", "task_completed", "task_complete", "turn_completed", "turn_complete":
             showDone(
                 title: title.isEmpty ? "\(source) done" : title,
-                message: message.isEmpty ? "\(source) finished" : message
+                message: message.isEmpty ? "\(source) finished" : message,
+                payload: payload,
+                source: source
             )
 
         case "approval", "approval_requested", "permission", "permission.asked", "permission.updated", "permission_asked", "permission_updated", "permission_request", "question.asked", "question_asked", "requires_input", "required_input", "input_required", "needs_input", "user_input_requested":
             showApproval(
                 title: title.isEmpty ? "Approval needed" : title,
-                message: message.isEmpty ? "\(source) needs your input" : message
+                message: message.isEmpty ? "\(source) needs your input" : message,
+                payload: payload,
+                source: source
             )
 
         case "failed", "failure", "error", "errored", "session.error", "session_error", "task_failed", "task_error":
             showFailure(
                 title: title.isEmpty ? "Failed" : title,
-                message: message.isEmpty ? "\(source) hit an error" : message
+                message: message.isEmpty ? "\(source) hit an error" : message,
+                payload: payload,
+                source: source
             )
 
         case "running", "busy", "started", "start", "session.busy", "session_busy", "task_started", "task_start", "turn_started", "turn_start", "agent_turn_started", "agent_turn_start":
-            showRunning(
-                title: title,
-                message: message
-            )
+            return
 
         case "hide":
-            overlayController?.hide { [weak self] in
-                self?.mode = .idle
-                self?.isBusy = false
-            }
+            timeline.clear()
+            syncOverlay()
 
         default:
             print("Unknown event:", event)
@@ -1928,6 +2036,8 @@ final class NotchNotifierModel: ObservableObject {
             || normalized.contains("short title for a task")
             || normalized.contains("the tasks typically have to do with coding-related tasks")
             || normalized.contains("fill the structured title field")
+            || normalized.contains("you write the one-line activity update displayed beneath an existing codex task title")
+            || normalized.contains("fill the structured summary field")
             || normalized.contains("do not respond to the user")
             || normalized.contains("generate 0 to 3 hyperpersonalized suggestions")
             || normalized.contains("codex ambient suggestions")
@@ -1943,55 +2053,57 @@ final class NotchNotifierModel: ObservableObject {
             return false
         }
 
-        let internalKeys: Set<String> = ["title", "suggestions", "exclude"]
+        let internalKeys: Set<String> = ["title", "summary", "suggestions", "exclude"]
         let keys = Set(object.keys)
         return !keys.isEmpty && keys.isSubset(of: internalKeys)
     }
 
-    private func showRunning(title: String, message: String) {
-        guard !isBusy || mode != .idle else { return }
-
-        statusText = ""
-        detailText = ""
-        isBusy = true
-        mode = .idle
-        print("showRunning called")
-        overlayController?.hide()
+    private func threadID(from payload: [String: Any]) -> String? {
+        for key in ["thread-id", "thread_id", "session_id", "sessionID", "sessionId", "session-id"] {
+            let value = textValue(for: key, in: payload)
+            if !value.isEmpty { return value }
+        }
+        return nil
     }
 
-    private func showDone(title: String, message: String) {
+    @discardableResult
+    private func record(_ status: StatusMode, title: String, message: String, payload: [String: Any], source: String) -> Bool {
         ensureOverlay()
-        statusText = title
-        detailText = message
-        isBusy = false
-        mode = .done
-        successPulse += 1
-        print("showDone called")
-        playCompletionChime()
-        overlayController?.show(mode: .done)
+        let outcome = timeline.record(source: source, threadID: threadID(from: payload), title: title, detail: message, mode: status)
+        if outcome.changed { syncOverlay() }
+        return outcome.shouldChime
     }
 
-    private func showApproval(title: String, message: String) {
-        ensureOverlay()
-        statusText = title
-        detailText = message
-        isBusy = false
-        mode = .needsInput
-        approvalPulse += 1
-        print("showApproval called")
-        playApprovalChime()
-        overlayController?.show(mode: .needsInput)
+    private func syncOverlay() {
+        notices = timeline.notices
+        mode = notices.first?.mode ?? .idle
+        if notices.isEmpty {
+            overlayController?.hide()
+        } else {
+            overlayController?.show(mode: mode, itemCount: notices.count)
+        }
     }
 
-    private func showFailure(title: String, message: String) {
-        ensureOverlay()
-        statusText = title
-        detailText = message
-        isBusy = false
-        mode = .failed
-        print("showFailure called")
-        playFailureChime()
-        overlayController?.show(mode: .failed)
+    private func showRunning(title: String, message: String, payload: [String: Any], source: String) {
+        record(.running, title: title, message: message, payload: payload, source: source)
+    }
+
+    private func showDone(title: String, message: String, payload: [String: Any], source: String) {
+        if record(.done, title: title, message: message, payload: payload, source: source) {
+            playCompletionChime()
+        }
+    }
+
+    private func showApproval(title: String, message: String, payload: [String: Any], source: String) {
+        if record(.needsInput, title: title, message: message, payload: payload, source: source) {
+            playApprovalChime()
+        }
+    }
+
+    private func showFailure(title: String, message: String, payload: [String: Any], source: String) {
+        if record(.failed, title: title, message: message, payload: payload, source: source) {
+            playFailureChime()
+        }
     }
 
     private func playCompletionChime() {
@@ -2038,12 +2150,12 @@ final class NotchNotifierModel: ObservableObject {
 }
 
 struct UsagePanelView: View {
-    @StateObject private var model = UsagePanelModel()
+    @ObservedObject private var model = UsagePanelModel.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Label("AI Usage", systemImage: "bolt.horizontal.circle.fill")
+                Text("AI Usage")
                     .font(.subheadline.weight(.semibold))
 
                 Spacer()
@@ -2092,14 +2204,9 @@ struct UsagePanelView: View {
                 activityColor: Color(red: 0.45, green: 0.55, blue: 1.00),
                 rows: [
                     remainingRow(
-                        "5h left",
-                        remainingPercent: codexPrimaryLeft,
-                        resetAt: model.snapshot.codexPrimaryResetAt
-                    ),
-                    remainingRow(
                         "Weekly left",
-                        remainingPercent: codexSecondaryLeft,
-                        resetAt: model.snapshot.codexSecondaryResetAt
+                        remainingPercent: codexWeeklyLeft,
+                        resetAt: model.snapshot.codexWeeklyResetAt
                     )
                 ]
             )
@@ -2130,10 +2237,6 @@ struct UsagePanelView: View {
         }
     }
 
-    private var codexPrimaryLeft: Double? {
-        model.snapshot.codexPrimaryLimit.map { 100 - $0 }
-    }
-
     private var openCodeFiveHourLeft: Double {
         openCodeRemainingPercent(model.snapshot.openCodeFiveHour, limit: 12)
     }
@@ -2146,8 +2249,8 @@ struct UsagePanelView: View {
         openCodeRemainingPercent(model.snapshot.openCodeMonthly, limit: 60)
     }
 
-    private var codexSecondaryLeft: Double? {
-        model.snapshot.codexSecondaryLimit.map { 100 - $0 }
+    private var codexWeeklyLeft: Double? {
+        model.snapshot.codexWeeklyLimit.map { 100 - $0 }
     }
 
     private var claudeFiveHourLeft: Double? {
@@ -2540,13 +2643,15 @@ struct StatusGlyph: View {
 
 struct OverlayIslandView: View {
     @EnvironmentObject private var model: NotchNotifierModel
+    @State private var hasScrolledAway = false
+    @State private var leadingScrollOffset: CGFloat?
 
     private var metrics: NotchMetrics {
-        NSScreen.main?.readNotchMetrics() ?? .fallback
+        NSScreen.preferredNotchScreen?.readNotchMetrics() ?? .fallback
     }
 
     private var layout: IslandLayout {
-        IslandLayout.forMode(model.mode, notchWidth: metrics.notchWidth)
+        IslandLayout.forMode(model.mode, notchWidth: metrics.notchWidth, screenWidth: metrics.screenFrame.width, itemCount: model.notices.count)
     }
 
     private func hiddenTopHeight(totalHeight: CGFloat) -> CGFloat {
@@ -2563,44 +2668,50 @@ struct OverlayIslandView: View {
                 .fill(Color.black)
 
             GeometryReader { geo in
-                if model.mode != .idle {
-                    VStack(spacing: 2) {
-                        HStack(spacing: 8) {
-                            StatusGlyph(
-                                mode: model.mode,
-                                isBusy: model.isBusy,
-                                successPulse: model.successPulse,
-                                approvalPulse: model.approvalPulse,
-                                size: 13,
-                                darkBackground: true
-                            )
-
-                            Text(model.statusText)
-                                .font(.system(size: 11.5, weight: .semibold))
-                                .foregroundColor(.white)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-
-                            Spacer(minLength: 0)
+                if !model.notices.isEmpty {
+                    ZStack(alignment: .trailing) {
+                        ScrollViewReader { proxy in
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 8) {
+                                    ForEach(model.notices) { notice in
+                                        noticeCard(notice)
+                                            .id(notice.id)
+                                    }
+                                }
+                                .padding(.horizontal, 12)
+                                .frame(minWidth: layout.width)
+                                .id("notice-scroll-start")
+                            }
+                            .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                                geometry.contentOffset.x
+                            } action: { _, offset in
+                                let leading = leadingScrollOffset ?? offset
+                                if leadingScrollOffset == nil { leadingScrollOffset = offset }
+                                hasScrolledAway = offset > leading + 8
+                            }
+                            .onChange(of: model.notices.first?.id) { _, firstID in
+                                if firstID != nil {
+                                    proxy.scrollTo("notice-scroll-start", anchor: .leading)
+                                    leadingScrollOffset = nil
+                                    hasScrolledAway = false
+                                }
+                            }
                         }
 
-                        if !model.detailText.isEmpty {
-                            Text(model.detailText)
-                                .font(.system(size: 10))
-                                .foregroundColor(.white.opacity(0.70))
-                                .lineLimit(1)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.leading, 25)
+                        if model.notices.count > 2 && !hasScrolledAway {
+                            Text("+\(model.notices.count - 2)")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(.white.opacity(0.65))
+                                .padding(.trailing, 7)
+                                .allowsHitTesting(false)
                         }
                     }
                     .frame(
-                        width: max(1, geo.size.width - 24),
+                        width: max(1, geo.size.width),
                         height: visibleHeight(totalHeight: geo.size.height),
                         alignment: .center
                     )
                     .offset(y: hiddenTopHeight(totalHeight: geo.size.height))
-                    .padding(.horizontal, 12)
                 }
             }
         }
@@ -2611,19 +2722,95 @@ struct OverlayIslandView: View {
             model.dismissOverlayState()
         }
     }
+
+    private func noticeCard(_ notice: AgentNotice) -> some View {
+        let compact = model.notices.count > 1
+
+        return VStack(alignment: .center, spacing: 1) {
+            Text(displayTitle(for: notice))
+                .font(.system(size: compact ? 10 : 11, weight: .semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Text(statusLine(for: notice))
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(statusColor(for: notice.mode))
+                .lineLimit(1)
+        }
+        .frame(width: compact ? 116 : 154)
+        .frame(width: compact ? 128 : 198, height: 34, alignment: .center)
+        .overlay(alignment: .leading) {
+            if !compact {
+                StatusGlyph(
+                    mode: notice.mode,
+                    isBusy: false,
+                    successPulse: 0,
+                    approvalPulse: 0,
+                    size: 12,
+                    darkBackground: true
+                )
+                .padding(.leading, 8)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            model.dismissNotice(notice.id)
+        }
+        .help("Click to dismiss · \(notice.detail)")
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(displayTitle(for: notice)), \(statusLine(for: notice)), \(notice.detail)")
+    }
+
+    private func statusLine(for notice: AgentNotice) -> String {
+        switch notice.mode {
+        case .done:
+            return "\(notice.source) finished"
+        case .needsInput:
+            return "\(notice.source) needs input"
+        case .failed:
+            return "\(notice.source) failed"
+        case .running:
+            return "\(notice.source) running"
+        case .idle:
+            return notice.source
+        }
+    }
+
+    private func statusColor(for mode: StatusMode) -> Color {
+        switch mode {
+        case .done:
+            return .green
+        case .needsInput:
+            return .yellow
+        case .failed:
+            return .red
+        case .idle, .running:
+            return .white
+        }
+    }
+
+    private func displayTitle(for notice: AgentNotice) -> String {
+        if notice.title.hasPrefix("Done: ") {
+            return String(notice.title.dropFirst("Done: ".count))
+        }
+        return notice.title
+    }
 }
 
 final class NotchOverlayController {
     private let panel: NSPanel
     private var currentMode: StatusMode = .idle
+    private var currentItemCount = 0
     private var hideWorkItem: DispatchWorkItem?
+    private var presentationMetrics: NotchMetrics
 
     private let showDuration: TimeInterval = 0.28
     private let hideDuration: TimeInterval = 0.22
 
     init(rootView: some View) {
-        let metrics = NSScreen.main?.readNotchMetrics() ?? .fallback
-        let layout = IslandLayout.forMode(.done, notchWidth: metrics.notchWidth)
+        let metrics = NSScreen.preferredNotchScreen?.readNotchMetrics() ?? .fallback
+        presentationMetrics = metrics
+        let layout = IslandLayout.forMode(.done, notchWidth: metrics.notchWidth, screenWidth: metrics.screenFrame.width, itemCount: 1)
 
         let startRect = NSRect(
             x: metrics.screenFrame.midX - (layout.width / 2),
@@ -2667,34 +2854,43 @@ final class NotchOverlayController {
         }
     }
 
-    func show(mode: StatusMode) {
+    func show(mode: StatusMode, itemCount: Int) {
         hideWorkItem?.cancel()
         hideWorkItem = nil
 
+        if !panel.isVisible {
+            presentationMetrics = NSScreen.preferredNotchScreen?.readNotchMetrics() ?? .fallback
+        }
+
         currentMode = mode
+        currentItemCount = itemCount
 
-        let visibleFrame = frame(for: currentMode, hidden: false)
-        let hiddenFrame = frame(for: currentMode, hidden: true)
+        let visibleFrame = frame(for: currentMode)
 
-        panel.ignoresMouseEvents = (mode == .idle || mode == .running)
+        panel.ignoresMouseEvents = (mode == .idle)
         print("panel show mode =", mode, "ignoresMouseEvents =", panel.ignoresMouseEvents)
 
         if !panel.isVisible {
-            panel.setFrame(hiddenFrame, display: true)
+            panel.setFrame(visibleFrame, display: true)
+            panel.alphaValue = 0
             panel.orderFrontRegardless()
         }
 
-        animatePanel(to: visibleFrame, duration: showDuration)
+        animatePanel(to: visibleFrame, alpha: 1, duration: showDuration)
     }
 
     func hide(completion: (@MainActor () -> Void)? = nil) {
         hideWorkItem?.cancel()
 
-        let hiddenFrame = frame(for: currentMode, hidden: true)
-        animatePanel(to: hiddenFrame, duration: hideDuration)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = hideDuration
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().alphaValue = 0
+        }
 
         let workItem = DispatchWorkItem { [weak self] in
             self?.panel.orderOut(nil)
+            self?.panel.alphaValue = 1
             Task { @MainActor in
                 completion?()
             }
@@ -2705,26 +2901,38 @@ final class NotchOverlayController {
     }
 
     private func repositionForCurrentMode() {
-        panel.setFrame(frame(for: currentMode, hidden: !panel.isVisible), display: true)
+        if panel.isVisible {
+            let presentationScreenStillExists = NSScreen.screens.contains {
+                $0.frame.equalTo(presentationMetrics.screenFrame)
+            }
+            guard !presentationScreenStillExists else { return }
+
+            presentationMetrics = NSScreen.preferredNotchScreen?.readNotchMetrics() ?? .fallback
+            panel.setFrame(frame(for: currentMode), display: true)
+            return
+        }
+
+        presentationMetrics = NSScreen.preferredNotchScreen?.readNotchMetrics() ?? .fallback
+        panel.setFrame(frame(for: currentMode), display: true)
     }
 
-    private func frame(for mode: StatusMode, hidden: Bool) -> NSRect {
-        let metrics = NSScreen.main?.readNotchMetrics() ?? .fallback
-        let layout = IslandLayout.forMode(mode, notchWidth: metrics.notchWidth)
+    private func frame(for mode: StatusMode) -> NSRect {
+        let layout = IslandLayout.forMode(mode, notchWidth: presentationMetrics.notchWidth, screenWidth: presentationMetrics.screenFrame.width, itemCount: currentItemCount)
 
         return NSRect(
-            x: metrics.screenFrame.midX - (layout.width / 2),
-            y: hidden ? metrics.screenFrame.maxY : metrics.screenFrame.maxY - layout.height,
+            x: presentationMetrics.screenFrame.midX - (layout.width / 2),
+            y: presentationMetrics.screenFrame.maxY - layout.height,
             width: layout.width,
             height: layout.height
         )
     }
 
-    private func animatePanel(to frame: NSRect, duration: TimeInterval) {
+    private func animatePanel(to frame: NSRect, alpha: CGFloat, duration: TimeInterval) {
         NSAnimationContext.runAnimationGroup { context in
             context.duration = duration
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             panel.animator().setFrame(frame, display: true)
+            panel.animator().alphaValue = alpha
         }
     }
 }

@@ -6,6 +6,7 @@
 //
 
 import Testing
+import Foundation
 @testable import CodingNotificator
 
 struct CodingNotificatorTests {
@@ -97,6 +98,46 @@ struct CodingNotificatorTests {
     }
 
     @MainActor
+    @Test func ignoresCodexUserActivitySummaryCompletions() async throws {
+        let payload: [String: Any] = [
+            "type": "agent-turn-complete",
+            "client": "Codex Desktop",
+            "input-messages": [
+                "You write the one-line activity update displayed beneath an existing Codex task title. Fill the structured summary field with one plain-text sentence. Summarize the user's latest request without implying that the requested work is already complete."
+            ],
+            "last-assistant-message": "{\"summary\":\"Fix the popup that appears before Codex finishes\"}"
+        ]
+
+        #expect(!NotchNotifierModel.shared.shouldShowCodexTurnComplete(payload, source: "Codex"))
+    }
+
+    @MainActor
+    @Test func ignoresCodexAssistantActivitySummaryCompletions() async throws {
+        let payload: [String: Any] = [
+            "type": "agent-turn-complete",
+            "client": "Codex Desktop",
+            "input-messages": [
+                "Fill the structured summary field with one plain-text sentence of at most 280 characters. Summarize only what the assistant actually completed, found, answered, recommended, or could not do."
+            ],
+            "last-assistant-message": "{\"summary\":\"Fixed the notifier and verified the regression tests\"}"
+        ]
+
+        #expect(!NotchNotifierModel.shared.shouldShowCodexTurnComplete(payload, source: "Codex"))
+    }
+
+    @MainActor
+    @Test func ignoresStandaloneCodexSummaryMetadata() async throws {
+        let payload: [String: Any] = [
+            "type": "agent-turn-complete",
+            "client": "Codex Desktop",
+            "input-messages": ["Internal metadata update"],
+            "last-assistant-message": "{\"summary\":\"Update the visible task activity line\"}"
+        ]
+
+        #expect(!NotchNotifierModel.shared.shouldShowCodexTurnComplete(payload, source: "Codex"))
+    }
+
+    @MainActor
     @Test func keepsNormalOneMessageCodexCompletions() async throws {
         let payload: [String: Any] = [
             "type": "agent-turn-complete",
@@ -128,6 +169,46 @@ struct CodingNotificatorTests {
         ]
 
         #expect(NotchNotifierModel.shared.codexChatDisplayName(from: payload) == "Codex 019dfd6d")
+    }
+
+    @MainActor
+    @Test func keepsMultipleThreadCompletionsVisible() {
+        var timeline = NoticeTimeline()
+        timeline.record(source: "Codex", threadID: "thread-a", title: "First", detail: "Finished", mode: .done)
+        timeline.record(source: "Codex", threadID: "thread-b", title: "Second", detail: "Finished", mode: .done)
+
+        #expect(timeline.notices.map(\.title) == ["Second", "First"])
+    }
+
+    @MainActor
+    @Test func completionReplacesOnlyItsOwnRunningThread() {
+        var timeline = NoticeTimeline()
+        timeline.record(source: "Codex", threadID: "thread-a", title: "Working A", detail: "", mode: .running)
+        timeline.record(source: "Claude Code", threadID: "session-b", title: "Working B", detail: "", mode: .running)
+        timeline.record(source: "Codex", threadID: "thread-a", title: "Finished A", detail: "Done", mode: .done)
+
+        #expect(timeline.notices.count == 2)
+        #expect(timeline.notices[0].title == "Finished A")
+        #expect(timeline.notices[1].title == "Working B")
+        #expect(timeline.notices[1].mode == .running)
+    }
+
+    @Test func recognizesPrimaryWeeklyCodexWindow() {
+        let weekly: [String: Any] = ["usedPercent": 44, "windowDurationMins": 10_080]
+        let limits: [String: Any] = ["primary": weekly, "secondary": NSNull()]
+
+        let selected = UsageReader.codexWeeklyWindow(in: limits)
+        #expect(selected?["usedPercent"] as? Int == 44)
+    }
+
+    @Test func recognizesSecondaryWeeklyCodexWindow() {
+        let limits: [String: Any] = [
+            "primary": ["usedPercent": 8, "windowDurationMins": 300],
+            "secondary": ["usedPercent": 63, "windowDurationMins": 10_080]
+        ]
+
+        let selected = UsageReader.codexWeeklyWindow(in: limits)
+        #expect(selected?["usedPercent"] as? Int == 63)
     }
 
 }
