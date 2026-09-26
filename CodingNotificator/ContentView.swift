@@ -2,7 +2,6 @@ import SwiftUI
 import AppKit
 import Combine
 import Foundation
-import QuartzCore
 
 enum StatusMode {
     case idle
@@ -1449,28 +1448,52 @@ struct IslandLayout {
     }
 }
 
-struct NotchSlabShape: Shape {
-    var bottomRadius: CGFloat = 18
+struct NotchMorphShape: Shape {
+    let notchWidth: CGFloat
+    var expandedWidth: CGFloat
+    let topInset: CGFloat
+    let hasNotch: Bool
+    var progress: CGFloat
+
+    var animatableData: AnimatablePair<CGFloat, CGFloat> {
+        get { AnimatablePair(progress, expandedWidth) }
+        set {
+            progress = newValue.first
+            expandedWidth = newValue.second
+        }
+    }
 
     func path(in rect: CGRect) -> Path {
+        let amount = min(1, max(0, progress))
+        let center = rect.midX
+        let baseWidth = min(rect.width, notchWidth)
+        let width = baseWidth + (min(rect.width, expandedWidth) - baseWidth) * amount
+        let height = min(rect.height, max(1, topInset - 1) + (rect.height - max(1, topInset - 1)) * amount)
+
+        if !hasNotch {
+            let pillHeight = 28 + (rect.height - 34) * amount
+            let pill = CGRect(x: center - width / 2, y: 6, width: width, height: pillHeight)
+            return Path(roundedRect: pill, cornerRadius: min(18, pillHeight / 2))
+        }
+
+        let halfWidth = width / 2
+        let radius = min(18, halfWidth, height / 2)
         var path = Path()
-        let r = min(bottomRadius, rect.width / 2, rect.height / 2)
 
-        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
-        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
-        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - r))
+        path.move(to: CGPoint(x: center - halfWidth, y: 0))
+        path.addLine(to: CGPoint(x: center + halfWidth, y: 0))
+        path.addLine(to: CGPoint(x: center + halfWidth, y: height - radius))
         path.addQuadCurve(
-            to: CGPoint(x: rect.maxX - r, y: rect.maxY),
-            control: CGPoint(x: rect.maxX, y: rect.maxY)
+            to: CGPoint(x: center + halfWidth - radius, y: height),
+            control: CGPoint(x: center + halfWidth, y: height)
         )
-        path.addLine(to: CGPoint(x: rect.minX + r, y: rect.maxY))
+        path.addLine(to: CGPoint(x: center - halfWidth + radius, y: height))
         path.addQuadCurve(
-            to: CGPoint(x: rect.minX, y: rect.maxY - r),
-            control: CGPoint(x: rect.minX, y: rect.maxY)
+            to: CGPoint(x: center - halfWidth, y: height - radius),
+            control: CGPoint(x: center - halfWidth, y: height)
         )
-        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addLine(to: CGPoint(x: center - halfWidth, y: 0))
         path.closeSubpath()
-
         return path
     }
 }
@@ -1766,6 +1789,7 @@ final class NotchNotifierModel: ObservableObject {
 
     @Published private(set) var notices: [AgentNotice] = []
     @Published var mode: StatusMode = .idle
+    @Published private(set) var isOverlayExpanded = false
     private var timeline = NoticeTimeline()
 
     // Sandbox-aware path. This is the actual path your installed app uses.
@@ -1810,14 +1834,25 @@ final class NotchNotifierModel: ObservableObject {
     }
 
     func dismissOverlayState() {
+        let previousCount = timeline.notices.count
         timeline.dismissFinished()
-        syncOverlay()
+        guard timeline.notices.count != previousCount else { return }
+        if timeline.notices.isEmpty {
+            hideOverlayAfterAnimation()
+        } else {
+            syncOverlay()
+        }
     }
 
     func dismissNotice(_ id: String) {
         let previousCount = timeline.notices.count
         timeline.dismiss(id)
-        if timeline.notices.count != previousCount { syncOverlay() }
+        guard timeline.notices.count != previousCount else { return }
+        if timeline.notices.isEmpty {
+            hideOverlayAfterAnimation()
+        } else {
+            syncOverlay()
+        }
     }
 
     private func ensureOverlay() {
@@ -1884,7 +1919,7 @@ final class NotchNotifierModel: ObservableObject {
 
         case "hide":
             timeline.clear()
-            syncOverlay()
+            hideOverlayAfterAnimation()
 
         default:
             print("Unknown event:", event)
@@ -2075,12 +2110,33 @@ final class NotchNotifierModel: ObservableObject {
     }
 
     private func syncOverlay() {
+        if timeline.notices.isEmpty {
+            hideOverlayAfterAnimation()
+            return
+        }
+
         notices = timeline.notices
         mode = notices.first?.mode ?? .idle
-        if notices.isEmpty {
-            overlayController?.hide()
-        } else {
-            overlayController?.show(mode: mode, itemCount: notices.count)
+        overlayController?.show(mode: mode)
+        // Give the hosting view one render pass in its collapsed state before expanding.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.timeline.notices.isEmpty else { return }
+            self.isOverlayExpanded = true
+        }
+    }
+
+    private func hideOverlayAfterAnimation() {
+        isOverlayExpanded = false
+        guard let overlayController else {
+            notices = timeline.notices
+            mode = notices.first?.mode ?? .idle
+            return
+        }
+
+        overlayController.hide { [weak self] in
+            guard let self else { return }
+            self.notices = self.timeline.notices
+            self.mode = self.notices.first?.mode ?? .idle
         }
     }
 
@@ -2645,6 +2701,9 @@ struct OverlayIslandView: View {
     @EnvironmentObject private var model: NotchNotifierModel
     @State private var hasScrolledAway = false
     @State private var leadingScrollOffset: CGFloat?
+    @State private var morphProgress: CGFloat = 0
+    @State private var contentOpacity: CGFloat = 0
+    @State private var presentationToken = 0
 
     private var metrics: NotchMetrics {
         NSScreen.preferredNotchScreen?.readNotchMetrics() ?? .fallback
@@ -2652,6 +2711,20 @@ struct OverlayIslandView: View {
 
     private var layout: IslandLayout {
         IslandLayout.forMode(model.mode, notchWidth: metrics.notchWidth, screenWidth: metrics.screenFrame.width, itemCount: model.notices.count)
+    }
+
+    private var canvasWidth: CGFloat {
+        min(metrics.screenFrame.width - 32, max(metrics.notchWidth, 288))
+    }
+
+    private var morphShape: NotchMorphShape {
+        NotchMorphShape(
+            notchWidth: metrics.notchWidth,
+            expandedWidth: layout.width,
+            topInset: metrics.topUnsafeHeight,
+            hasNotch: metrics.hasNotch,
+            progress: morphProgress
+        )
     }
 
     private func hiddenTopHeight(totalHeight: CGFloat) -> CGFloat {
@@ -2664,8 +2737,9 @@ struct OverlayIslandView: View {
 
     var body: some View {
         ZStack {
-            NotchSlabShape(bottomRadius: 18)
+            morphShape
                 .fill(Color.black)
+                .animation(.smooth(duration: 0.28), value: layout.width)
 
             GeometryReader { geo in
                 if !model.notices.isEmpty {
@@ -2714,12 +2788,45 @@ struct OverlayIslandView: View {
                     .offset(y: hiddenTopHeight(totalHeight: geo.size.height))
                 }
             }
+            .frame(width: layout.width, height: layout.height)
+            .opacity(contentOpacity)
+            .mask(morphShape.animation(.smooth(duration: 0.28), value: layout.width))
         }
-        .frame(width: layout.width, height: layout.height, alignment: .top)
+        .frame(width: canvasWidth, height: 72, alignment: .top)
         .clipped()
-        .contentShape(Rectangle())
+        .contentShape(morphShape)
         .onTapGesture(count: 2) {
             model.dismissOverlayState()
+        }
+        .onAppear {
+            updatePresentation(expanded: model.isOverlayExpanded)
+        }
+        .onChange(of: model.isOverlayExpanded) { _, expanded in
+            updatePresentation(expanded: expanded)
+        }
+    }
+
+    private func updatePresentation(expanded: Bool) {
+        presentationToken += 1
+        let token = presentationToken
+
+        if expanded {
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
+                morphProgress = 1
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                guard presentationToken == token, model.isOverlayExpanded else { return }
+                withAnimation(.easeOut(duration: 0.20)) {
+                    contentOpacity = 1
+                }
+            }
+        } else {
+            withAnimation(.easeOut(duration: 0.10)) {
+                contentOpacity = 0
+            }
+            withAnimation(.smooth(duration: 0.30)) {
+                morphProgress = 0
+            }
         }
     }
 
@@ -2799,28 +2906,18 @@ struct OverlayIslandView: View {
 
 final class NotchOverlayController {
     private let panel: NSPanel
-    private var currentMode: StatusMode = .idle
-    private var currentItemCount = 0
     private var hideWorkItem: DispatchWorkItem?
     private var presentationMetrics: NotchMetrics
 
-    private let showDuration: TimeInterval = 0.28
-    private let hideDuration: TimeInterval = 0.22
+    private let hideDuration: TimeInterval = 0.36
 
     init(rootView: some View) {
         let metrics = NSScreen.preferredNotchScreen?.readNotchMetrics() ?? .fallback
         presentationMetrics = metrics
-        let layout = IslandLayout.forMode(.done, notchWidth: metrics.notchWidth, screenWidth: metrics.screenFrame.width, itemCount: 1)
-
-        let startRect = NSRect(
-            x: metrics.screenFrame.midX - (layout.width / 2),
-            y: metrics.screenFrame.maxY - layout.height,
-            width: layout.width,
-            height: layout.height
-        )
+        let frame = Self.frame(for: metrics)
 
         panel = NSPanel(
-            contentRect: startRect,
+            contentRect: frame,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -2854,7 +2951,7 @@ final class NotchOverlayController {
         }
     }
 
-    func show(mode: StatusMode, itemCount: Int) {
+    func show(mode: StatusMode) {
         hideWorkItem?.cancel()
         hideWorkItem = nil
 
@@ -2862,35 +2959,21 @@ final class NotchOverlayController {
             presentationMetrics = NSScreen.preferredNotchScreen?.readNotchMetrics() ?? .fallback
         }
 
-        currentMode = mode
-        currentItemCount = itemCount
-
-        let visibleFrame = frame(for: currentMode)
-
         panel.ignoresMouseEvents = (mode == .idle)
         print("panel show mode =", mode, "ignoresMouseEvents =", panel.ignoresMouseEvents)
 
         if !panel.isVisible {
-            panel.setFrame(visibleFrame, display: true)
-            panel.alphaValue = 0
+            panel.setFrame(Self.frame(for: presentationMetrics), display: true)
             panel.orderFrontRegardless()
         }
-
-        animatePanel(to: visibleFrame, alpha: 1, duration: showDuration)
     }
 
     func hide(completion: (@MainActor () -> Void)? = nil) {
         hideWorkItem?.cancel()
-
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = hideDuration
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            panel.animator().alphaValue = 0
-        }
+        panel.ignoresMouseEvents = true
 
         let workItem = DispatchWorkItem { [weak self] in
             self?.panel.orderOut(nil)
-            self?.panel.alphaValue = 1
             Task { @MainActor in
                 completion?()
             }
@@ -2908,32 +2991,23 @@ final class NotchOverlayController {
             guard !presentationScreenStillExists else { return }
 
             presentationMetrics = NSScreen.preferredNotchScreen?.readNotchMetrics() ?? .fallback
-            panel.setFrame(frame(for: currentMode), display: true)
+            panel.setFrame(Self.frame(for: presentationMetrics), display: true)
             return
         }
 
         presentationMetrics = NSScreen.preferredNotchScreen?.readNotchMetrics() ?? .fallback
-        panel.setFrame(frame(for: currentMode), display: true)
+        panel.setFrame(Self.frame(for: presentationMetrics), display: true)
     }
 
-    private func frame(for mode: StatusMode) -> NSRect {
-        let layout = IslandLayout.forMode(mode, notchWidth: presentationMetrics.notchWidth, screenWidth: presentationMetrics.screenFrame.width, itemCount: currentItemCount)
-
+    private static func frame(for metrics: NotchMetrics) -> NSRect {
+        let width = min(metrics.screenFrame.width - 32, max(metrics.notchWidth, 288))
+        let height: CGFloat = 72
         return NSRect(
-            x: presentationMetrics.screenFrame.midX - (layout.width / 2),
-            y: presentationMetrics.screenFrame.maxY - layout.height,
-            width: layout.width,
-            height: layout.height
+            x: metrics.screenFrame.midX - width / 2,
+            y: metrics.screenFrame.maxY - height,
+            width: width,
+            height: height
         )
-    }
-
-    private func animatePanel(to frame: NSRect, alpha: CGFloat, duration: TimeInterval) {
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = duration
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            panel.animator().setFrame(frame, display: true)
-            panel.animator().alphaValue = alpha
-        }
     }
 }
 
